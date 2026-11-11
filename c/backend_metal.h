@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "affine_quant.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,9 +24,34 @@ typedef struct ColiMetalTensor ColiMetalTensor;
 int  coli_metal_init(void);
 void coli_metal_shutdown(void);
 int  coli_metal_available(void);
-/* Bytes of unified memory in use by wrapped tensors, and their count. */
+/* Resident handle count and bytes. Existing QT handles retain weight-only byte
+ * accounting; affine handles include their weight, scale, and bias buffers.
+ */
 void coli_metal_stats(size_t *tensor_count, size_t *tensor_bytes);
 int  coli_metal_mem_info(size_t *used_bytes, size_t *total_bytes);
+
+/* ---- Standalone elementwise / normalization ops ---------------------------------- */
+/*
+ * RMSNorm: out[nrows*D] = rmsnorm(x[nrows*D], w[D], eps).
+ * Each of nrows independent rows of width D. w is shared (1 copy, [D]).
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_rmsnorm(float *x, const float *w, int nrows, int D, float eps);
+
+/*
+ * Residual add: y[i] += a[i] for i in [0, n).
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_add(float *y, const float *a, size_t n);
+
+/*
+ * SiLU gate-multiply: g[i] = silu(g[i]) * u[i] for i in [0, n).
+ * Destroy-u variant: u is consumed (gate * up fusion for SwiGLU).
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_silu_mul(float *g, const float *u, size_t n);
+/* Numerical-oracle hook for GLM-5.3 clamped SwiGLU. */
+int coli_metal_silu_mul_clamped(float *g, const float *u, size_t n, float limit);
 
 /*
  * y[S,O] = (x[S,I] @ W[O,I]^T) * scale[o]. fmt=4 (grouped int4) instead folds a
@@ -47,7 +74,93 @@ int coli_metal_matmul(ColiMetalTensor **tensor,
                       const void *weights, const float *scales,
                       int fmt, int S, int I, int O, int gs);
 
+/* Returns whether a validated MLX affine descriptor and batch fit the Metal
+ * shader's uint32 indexing ABI.  This predicate is portable and does not query
+ * hardware; coli_metal_affine_available() additionally requires initialized
+ * Q4/Q8 pipelines on a device with 32-lane simdgroups.
+ */
+static inline int
+coli_metal_affine_dispatch_supported(const ColiAffineQuantizedView *view,
+                                     int batch) {
+    size_t elements, groups;
+    if (batch <= 0 || coli_affine_validate(view) != COLI_AFFINE_OK)
+        return 0;
+    if (view->output_dim > UINT32_MAX || view->input_dim > UINT32_MAX ||
+        view->group_size > UINT32_MAX)
+        return 0;
+    groups = view->input_dim / view->group_size;
+    if (!coli_affine_size_mul(view->output_dim, groups, &elements) ||
+        elements > UINT32_MAX)
+        return 0;
+    if (!coli_affine_size_mul((size_t)batch, view->input_dim, &elements) ||
+        elements > UINT32_MAX)
+        return 0;
+    if (!coli_affine_size_mul((size_t)batch, view->output_dim, &elements) ||
+        elements > UINT32_MAX)
+        return 0;
+    return 1;
+}
+
+/* Dedicated MLX affine path.  This does not use or extend Colibri's QT fmt
+ * namespace: `view` names unsigned uint32-packed Q4/Q8 plus scale and bias.
+ * The first successful call wraps the three stable buffers in `tensor`, as
+ * coli_metal_matmul does for its existing weight formats.  Returns 0 for CPU
+ * fallback when validation, capability, allocation, or execution fails.
+ */
+typedef enum {
+    COLI_METAL_AFFINE_CAP_NOT_INITIALIZED = 0,
+    COLI_METAL_AFFINE_CAP_PIPELINE_UNAVAILABLE = 1,
+    COLI_METAL_AFFINE_CAP_SIMD_WIDTH_UNSUPPORTED = 2,
+    COLI_METAL_AFFINE_CAP_READY = 3
+} ColiMetalAffineCapability;
+
+/* Reports why the runtime affine path is unavailable so tests and callers can
+ * distinguish an optional hardware-width fallback from a pipeline failure.
+ */
+ColiMetalAffineCapability coli_metal_affine_capability(void);
+int coli_metal_affine_available(void);
+int coli_metal_matmul_affine(ColiMetalTensor **tensor,
+                             float *y, const float *x, int batch,
+                             const ColiAffineQuantizedView *view);
+
+/* Whole-slot buffers for bounded, refillable qpack expert slots.  A slot
+ * buffer wraps one page-aligned host slot in an MTLBuffer exactly ONCE
+ * (zero-copy); the pool refills the same memory with different experts, and
+ * every dispatch addresses the projection weight, scale, and bias sections
+ * by BYTE OFFSET inside that one registered buffer.  Nothing is keyed on the
+ * refillable host pointers and no bytes are copied at registration, so a
+ * refill cannot leave a stale GPU-side snapshot behind -- the exact hazard
+ * that makes the resident-handle path above (which caches by stable host
+ * pointer) unusable for reused memory.
+ *
+ * Registration requires base aligned to 16384 (the Apple page) and len a
+ * multiple of it and REFUSES anything else (returns NULL): the copying wrap
+ * fallback used elsewhere would silently detach the GPU from later refills.
+ * qpack expert strides already satisfy this (COLI_QPACK_PAGE_ALIGNMENT).
+ * Slot buffers count in coli_metal_stats() like resident tensor handles.
+ *
+ * coli_metal_matmul_affine_slot runs the same Q4/Q8 affine kernels as
+ * coli_metal_matmul_affine but takes the registered slot plus section byte
+ * offsets instead of a cached per-projection handle.  The checked view must
+ * describe the slot's CURRENT fill: every section must lie inside the
+ * registered range, the weights offset must be 4-byte aligned (the kernel
+ * reads uint32 words), and the view's host pointers must equal base+offset.
+ * A descriptor from a previous fill or the wrong slot is refused (returns 0,
+ * CPU fallback), never dispatched.  Synchronous like the rest of this API:
+ * when it returns, the GPU is done reading the slot and the caller may
+ * refill it. */
+typedef struct ColiMetalSlotBuffer ColiMetalSlotBuffer;
+ColiMetalSlotBuffer *coli_metal_slot_register(void *base, size_t len);
+void coli_metal_slot_unregister(ColiMetalSlotBuffer *slot);
+int coli_metal_matmul_affine_slot(ColiMetalSlotBuffer *slot,
+                                  size_t weights_offset,
+                                  size_t scales_offset,
+                                  size_t biases_offset,
+                                  float *y, const float *x, int batch,
+                                  const ColiAffineQuantizedView *view);
+
 void   coli_metal_tensor_free(ColiMetalTensor *tensor);
+/* Weight payload bytes only, preserving the established QT API contract. */
 size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
 
 /*
@@ -80,7 +193,7 @@ int coli_metal_layer_decode(float *x,
     const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
     const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
     const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
-    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt, int kvb_gs,
     const void *o_w, const float *o_s, int o_fmt, int o_gs,
     const void *shg_w, const float *shg_s, int shg_fmt, int shg_gs,
     const void *shu_w, const float *shu_s, int shu_fmt, int shu_gs,
@@ -110,15 +223,52 @@ int coli_metal_gemm(float *y, const float *x, const void *weights, const float *
 int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E, int K,
                      int Ksel, float topp, int normk, float rscale,
                      int *idx, float *w, int *keff);
+
+/*
+ * Training kernels (QLoRA, M6). Synchronous, correctness-first; each has a CPU
+ * reference in train/qlora_ops.h and a parity test in metal-test. Returns 1 on
+ * success, 0 -> caller must run the CPU path.
+ *
+ *   train_tmul:      dx[S,I] += dequant(W[O,I])^T dy[S,O]  (fmt 0=f32 no-scale,
+ *                    1=int8, 2=int4 per-row scale, 4=int4 grouped — gs columns
+ *                    per scale, scale[o*ng+i/gs]; the dequantized matrix is
+ *                    never materialized. gs ignored unless fmt=4)
+ *   train_lora_fwd:  z = x A^T ; y += scale * z B^T        (f32, z cached for bwd)
+ *   train_lora_bwd:  dz = scale * dy B ; dB += scale * dy^T z ; dA += dz^T x ;
+ *                    dx += dz A  (dx may be NULL to skip)
+ */
+int coli_metal_train_tmul(float *dx, const float *dy, const void *weights, const float *scales,
+                          int fmt, int gs, int S, int I, int O);
+int coli_metal_train_lora_fwd(float *y, float *z, const float *x,
+                              const float *A, const float *B, float scale,
+                              int S, int I, int O, int rank);
+int coli_metal_train_lora_bwd(float *dA, float *dB, float *dx,
+                              const float *x, const float *z, const float *dy,
+                              const float *A, const float *B, float scale,
+                              int S, int I, int O, int rank);
+
 void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);
 void coli_metal_attn_lat(double *ksched, double *gsched);
 int coli_metal_attn_decode(const float *x,
     const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
     const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
     const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
-    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt, int kvb_gs,
     const void *o_w, const float *o_s, int o_fmt, int o_gs,
     float *Lc, float *Rc, int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
+
+/*
+ * Write S KV-cache rows on GPU. out = Lc + pos_base*kv_lora gets rmsnorm(raw L, kv_a_ln, eps)
+ * and Rc + pos_base*qk_rope gets rope_interleave(raw R, pos_base+s, theta). Mirrors the
+ * CPU cache write: rmsnorm(Lc[pos], Lc[pos], kv_a_ln, kv_lora, eps) + rope_interleave(Rc[pos], pos, cfg).
+ * L_raw/R_raw are [S, kv_lora] / [S, qk_rope]. Returns 1 on success, 0 if Metal unavailable. */
+int coli_metal_kv_write(float *Lc, float *Rc, const float *L_raw, const float *R_raw,
+    const float *kv_a_ln, int S, int pos_base, int kv_lora, int qk_rope, float eps, float theta);
+
+/*
+ * Zero cache rows Lc[from*kv_lora .. (to-1)*kv_lora] and Rc[from*qk_rope .. (to-1)*qk_rope]
+ * on GPU. Covered by dedicated kernel. Returns 1 on success, 0 if Metal unavailable. */
+int coli_metal_kv_clear(float *Lc, float *Rc, int from, int to, int kv_lora, int qk_rope);
 
 /* Diagnostics: GPU blocks executed, CPU-fallback blocks, experts run on GPU. */
 void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *experts);
@@ -137,23 +287,30 @@ int coli_metal_resset_stats(double *flush_s);
  *
  *  D           = hidden size, Iinter = moe intermediate size
  *  g/u/d[e]    = pointers to expert e's gate/up/down quantized weights (in RAM slabs)
- *  gs/us/ds[e] = pointers to expert e's per-row scales
- *  fmt         = quant format (shared across experts). NOTE: fmt=4 (grouped int4) is
- *                NOT yet supported here -- gates to {1,2} and returns 0 (CPU fallback)
- *                for fmt=4 experts, same as before this stage. Grouped-int4 gained GPU
- *                support in mm_gemv (coli_metal_matmul/coli_metal_gemm/bind_gemv) only;
- *                extending the batched routed-expert path is future work (see PR_BODY.md).
+ *  gs/us/ds[e] = pointers to expert e's per-row (fmt=1/2) or per-group (fmt=4) scales
+ *  fmt         = quant format (shared across experts): 1=int8, 2=int4 per-row, 4=int4
+ *                grouped. qgs is the fmt=4 group size (ignored, pass 0, for fmt!=4).
+ *  qgs         = fmt=4 group size shared across experts in this block (0 for fmt!=4)
  *  xg          = packed activations [total_rows, D]; xoff[e] = row offset of expert e
  *  nr[e]       = rows for expert e; rows[]/rw[] map packed rows back to out positions
  *  out         = [S, D] accumulate target
  * Returns 1 on success, 0 to signal the caller to fall back to the CPU path.
  */
-int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
+int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
                          const int *rows, const float *rw,
                          float *out, int S);
+
+/* GLM-5.3 routed experts: same batched path, but with its clamped SwiGLU semantics.
+ * gate is upper-clamped to +limit; up is clamped to [-limit,+limit]. */
+int coli_metal_moe_block_clamped(int nb, int D, int Iinter, int fmt, int qgs,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw,
+                         float *out, int S, float swiglu_limit);
 
 /*
  * Async two-phase variant: begin encodes+commits the block (own scratch, no wait) and
@@ -163,12 +320,76 @@ int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
  * end returns 0 on GPU fault (caller redoes those experts on CPU).
  */
 typedef struct ColiMetalMoeHandle ColiMetalMoeHandle;
-ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt,
+ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
                          const int *rows, const float *rw);
 int coli_metal_moe_block_end(ColiMetalMoeHandle *h, float *out);
+
+/*
+ * KDA state recurrence for one token (decode: C=1). Replaces the serial per-head
+ * sweep in kda_forward(): decay state by alpha, accumulate kS, expand by kn*vt,
+ * merge output with qn. Each thread handles one element of [H * hd] output space;
+ * alpha/kn/qn/alpha are precomputed per-head arrays.
+ *   S          — in-place state `[H * hd * hd]` (row-major: [h][kk][vv])
+ *   qn         — L2-normalized, gated Q        `[H * hd]`
+ *   kn         — L2-normalized K               `[H * hd]`
+ *   vh         — gated V                        `[H * hd]`
+ *   alpha      — decay factors                  `[H * hd]`
+ *   beta       — mixing factor                  `[H]`
+ *   oh         — output accumulator             `[H * hd]` (initialized to 0 by kernel)
+ *   H, hd     — number of heads, head dimension
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_kda_state(float *S, const float *qn, const float *kn, const float *vh,
+                           const float *alpha, const float *beta, float *oh,
+                           int H, int hd);
+
+/*
+ * KDA Conv1d + SiLU gate for one projection (q, k, or v). Replaces the OMP-parallel
+ * depthwise conv loop in kda_forward(). The conv window is stateful across tokens:
+ *   conv_win[d*K]   — [P, K] shift register, oldest first, newest at K-1
+ *   vec[d]          — [P] raw projected value (saved to window[K-1], overwritten with gated result)
+ *   taps[d*K]       — [P, K] depthwise convolution taps (constant weights)
+ * One kernel dispatch per projection. Threadgroup of 256 threads, one thread per dimension.
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_kda_conv_silu(float *conv_win, float *vec, const float *taps, int P, int K);
+
+/*
+ * KDA L2 normalization: in-place normalization of Q and K per head.
+ *   q[h*hd:(h+1)*hd] *= 1/sqrt(sum(q^2) + eps) * qscale
+ *   k[h*hd:(h+1)*hd] *= 1/sqrt(sum(k^2) + eps)
+ *   eps = 1e-6, qscale = 1/sqrt(hd).
+ * One kernel dispatch for all H heads. Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_kda_l2_norm(float *q, float *k, int H, int hd, float qscale);
+
+/*
+ * Fused KDA token step: conv_silu(q,k,v) + l2_norm(q,k) + state recurrence,
+ * all encoded into a single MTLCommandBuffer. This eliminates per-kernel
+ * command-buffer creation/commit/wait overhead (~5 × 150us → one 150us).
+ *   win_q, win_k, win_v  — [P*K] conv windows (stateful across tokens)
+ *   qt, kt                — [P] = [H*hd] raw projected (become L2-normalized q/k in-place)
+ *   tv                    — [P] = [H*hd] raw projected (becomes SiLU-gated V in-place)
+ *   taps_q, taps_k, taps_v — [P*K] depthwise taps (constant)
+ *   S                     — [H*hd*hd] in-place attention state
+ *   alpha                 — [H*hd] precomputed decay factors (CPU from rgt+dt+A)
+ *   beta                  — [H] precomputed mixing factors (CPU from braw)
+ *   oh                    — [H*hd] output accumulator (written by kernel, read by CPU)
+ *   P, K, H, hd           — projection dim, kernel width, heads, head dim
+ * Returns 1 on success, 0 if Metal unavailable. Caller must zero oh[] before call.
+ */
+int coli_metal_kda_fused_token(
+    float *win_q, float *qt,
+    float *win_k, float *kt,
+    float *win_v, float *tv,
+    const float *taps_q, const float *taps_k, const float *taps_v,
+    float *S,
+    const float *alpha, const float *beta,
+    float *oh,
+    int P, int K, int H, int hd);
 
 #ifdef __cplusplus
 }

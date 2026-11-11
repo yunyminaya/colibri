@@ -2,6 +2,120 @@
 
 A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 generating tokens, with the GPU tier. Every step and every failure mode below was hit and verified on real hardware: Core Ultra 9 285K (AVX-VNNI) / RTX 5080 (sm_120) / 128 GB RAM / Windows 11 24H2 (issue #306). Steps are ordered so the long downloads run while you build.
 
+---
+
+## The one-step way
+
+Download the repository (**Code**, then **Download ZIP**, or `git clone`), unzip
+it and double-click **`START-HERE.bat`**. It checks for Python (and offers to
+install it with winget), finds your hardware, recommends a model that fits,
+gets the engine (built with MSYS2 when it is installed, with Vulkan when your
+GPU can use it; otherwise the prebuilt one from the release, which runs on the
+CPU or with Vulkan), downloads
+the model with resume and opens the dashboard. Running it again starts colibri
+directly. The same from a terminal: `py -3 c\coli setup`. See
+[quickstart.md](quickstart.md#the-one-step-way).
+
+## If you downloaded a release archive, start here
+
+The archive contains **`coli.cmd`**: that is the program to run. Double-click it
+for the quick start (it offers `coli.cmd setup`, the one-step path above), or
+from cmd/PowerShell:
+
+```
+coli.cmd chat   --model D:\models\glm52_i4
+coli.cmd serve  --model D:\models\glm52_i4
+coli.cmd doctor --model D:\models\glm52_i4
+```
+
+`colibri.exe`, `kimi_k3.exe` and the other `.exe` files are the **engines**.
+They are selected by the launcher from the model's `config.json`; started on
+their own they have no model to load, print how to launch and exit, which from
+Explorer looks like a window that flashes and disappears (#1241). The launcher
+needs Python 3 from https://www.python.org/downloads/ with "Add python.exe to
+PATH" ticked; the engines themselves need nothing.
+
+The engines are built with Vulkan, their shaders in `shaders\`: `coli.cmd
+setup` runs them on a GPU with a Vulkan driver (NVIDIA's, AMD's and Intel's
+drivers all install one) and on the CPU everywhere else, with nothing to build.
+
+**NVIDIA, CUDA.** For an RTX 30, 40 or 50 series card (compute capability 8.0
+and newer: A100, H100 and later too) the release also has
+**`colibri-<version>-windows-x86_64-cuda.zip`**. Unpack it into the same folder:
+it replaces `colibri.exe`, `qwen36.exe` and `kimi_k3.exe` with the same engines
+plus CUDA, and adds `coli_cuda.dll` and NVIDIA's CUDA runtime
+(`cudart64_12.dll`), so no CUDA toolkit is needed, only an NVIDIA driver for
+CUDA 12. `coli.cmd setup` then picks CUDA for the models those three engines
+run; an older card keeps Vulkan. To build the DLL yourself, for a card the
+package does not cover, see below.
+
+The rest of this page is for building from source.
+
+---
+> **2026-08-11: Additional validation with detailed steps for laptop setup** \
+Lenovo Thinkpad P16v (Intel Core i7 ultra (155H 1.4GHz), 64GB RAM, 2Tb NVME drive, Nvidia RTX 2000 Ada generation 8GB (AD107, 2023)).
+Windows 11 pro english.\
+**Software installs:**\
+`- nvidia drivers` from https://www.nvidia.com/en-us/drivers/\
+`- nvidia cuda toolkit` from https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local\
+`- msys2` from <https://github.com/msys2/msys2-installer/releases/download/2026-06-11/msys2-x86_64-20260611.exe> (the angle brackets keep the trailing line-break marker out of the link; the old form 404ed, #1405)\
+`- Microsoft Visual Studio 2022 built tools` installer from https://aka.ms/vs/17/release/vs_buildtools.exe then install Desktop Development with C++\
+`- winget install git.git python.python.3.14`\
+\
+`msys2` is installed in `c:\msys64` with its main launchers. (we will use `C:\msys64\mingw64.exe`)\
+Its executables tools `sh`, `bash`, `make`, `sed` etc go in `c:\msys64\usr\bin`. \
+From within `mingw64` we need to install compiler and make. \
+\
+`C:\msys64\mingw64.exe`\
+`pacman -S --needed mingw-w64-x86_64-gcc make`\
+\
+To see which AI oriented instructions your processor has, run CPU-Z from `https://www.cpuid.com/softwares/cpu-z.html` \
+or use the following command from msys2: `cat /proc/cpuinfo | grep ^flags | head -n 1`\
+To see which code optimizations are active in gcc compiler with the native flag check:\
+`gcc -march=native -dM -Q --help=target | grep -E "m(avx|ssw|aes|fma|sha|mmx)"`\
+For guidance about gcc optimizations, a good source cab be: `https://wiki.gentoo.org/wiki/GCC_optimization`\
+\
+**colibri.exe and coli_cuda.*** build from MS Visual Studio and Nvidia CUDA Toolkit:\
+\
+> **Build from a git clone, inside `c/`.** The release zip ships the engines and the Python only, no `Makefile` and no `backend_cuda.cu`: `make cuda-dll` in the unzipped release folder answers `No rule to make target 'cuda-dll'` (#1405). `git clone https://github.com/JustVugg/colibri`, then every `make` below runs in `colibri\c`.\
+Microsoft Visual Studio tools includes a `vcvars64.bat` batch file that appropriately sets all the paths. \
+It is in `"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`\
+\
+CUDA compilation is to be performed from a CMD shell, where we run `vcvars64` and then the path \
+extension for mingw64 build tools, as required by the make process (mingw64 `make` is used). \
+Open a command prompt shell (`cmd`, not powershell), cd to subfolder `c\` of the cloned repo and run:\
+\
+`%comspec% /k "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`
+`set PATH=%PATH%;C:\msys64\usr\bin`\
+`cd C:\Users\YOUR_USER\COLIBRI_REPO_FOLDER\c`\
+`make cuda-dll CUDA_ARCH=sm_89`\
+`make colibri.exe CUDA_DLL=1 ARCH=native`\
+`make iobench.exe`\
+\
+Replace `sm_89` with your Nvidia GPU architecture according to this table
+
+| Architecture | Example GPUs / Products | Compute Capability | `nvcc` Flag (`-arch=sm_XX`) |
+| :--- | :--- | :--- | :--- |
+| **Blackwell** | B100, B200, RTX 50x0 | 10.0, 12.0 | `sm_100`, `sm_120` |
+| **Hopper** | H100, H200, GH200 | 9.0 | `sm_90` / `sm_90a` |
+| **Ada Lovelace** | RTX 40x0, RTX 2000, L4, L40 | 8.9 | `sm_89` |
+| **Ampere** | A100, RTX 30x0, A10, Orin | 8.0, 8.6, 8.7 | `sm_80`, `sm_86`, `sm_87` |
+| **Turing** | RTX 2080, GTX 1660 Ti, T4 | 7.5 | `sm_75` |
+| **Volta** | V100, Titan V, Xavier | 7.0, 7.2 | `sm_70`, `sm_72` |
+| **Pascal** | P100, GTX 1080 Ti, P40 | 6.0, 6.1, 6.2 | `sm_60`, `sm_61`, `sm_62` |
+| **Maxwell** | M60, GTX 980, GTX TITAN X | 5.0, 5.2, 5.3 | `sm_50`, `sm_52`, `sm_53` |
+
+> The last make links `colibri.exe` with the newly built `coli_cuda.dll`\
+to just build `colibri.exe` with no nvidia CUDA support omit `CUDA_DLL=1`\
+`ARCH=native` ensures that colibri is build with optimizations specific for your CPU.\
+\
+**caveat**: to be sure the correct `make` is used, run `where.exe make` after path extension.\
+after compilation you should have `colibri.exe coli_cuda.lib, coli_cuda.exp, coli_cuda.dll` files.
+---
+
+
+
+
 ## 0. What you need
 
 | Piece | Why | Get it |
@@ -52,9 +166,14 @@ This is not Defender and not Mark-of-the-Web — SAC blocks *all* unsigned, unkn
 # 0 = off, 1 = enforced, 2 = evaluation
 ```
 
+SAC can also block the compiler itself: right after `pacman` installs gcc, its own
+`collect2.exe` is unknown to SAC until the cloud verdict arrives (two hours, in #1900),
+and gcc only says `cannot execute 'collect2.exe': CreateProcess: No such file or
+directory`. The fix is the same (SAC off and a reboot), or waiting for the verdict.
+
 ## 3. Build the CUDA DLL (GPU tier)
 
-nvcc needs MSVC as host compiler, so this one step must run from a shell with the MSVC environment: open **"x64 Native Tools Command Prompt for VS 2022"** from the Start menu (plain PowerShell will fail the `cl` check). Then:
+nvcc needs MSVC as host compiler, so this one step must run from a shell with the MSVC environment: open **"x64 Native Tools Command Prompt for VS 2022"** from the Start menu (plain PowerShell will fail the `cl` check). Not the generic "Developer Command Prompt": that one is the 32-bit compiler, and nvcc then fails inside `cuda_fp16.hpp` with `asm operand type size(8) does not match ... constraint 'r'` (#1405). `cl` alone prints which one you have: `for x64` is the right banner. Then:
 
 > **The VS prompt has no `sh.exe` (#478):** that prompt is a `cmd.exe` shell, and the `cuda-dll` recipe uses POSIX idioms (`command -v`, `{ ...; }`) that need `/bin/sh`. Run this once in the VS prompt before building:
 > ```cmd
@@ -101,6 +220,11 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 |---|---|---|
 | `'printf' is not recognized` / `The system cannot find the path specified` during `make colibri.exe` | scoop MinGW has no `sh.exe`; make fell back to cmd.exe (#478) | §0 — use MSYS2/w64devkit, or `set PATH=%PATH%;C:\msys64\usr\bin` |
 | `An Application Control policy has blocked this file` | Smart App Control | §2 — turn SAC off + **reboot** |
+| `cannot execute 'collect2.exe': CreateProcess: No such file or directory` | Smart App Control blocked the freshly installed compiler (#1900) | §2: SAC off and a reboot, or wait for SAC's verdict |
+| `storage size of 'r' isn't known` / `implicit declaration of function 'getrusage'`, or `make` stops with "builds for x86_64-pc-msys" (or cygwin) | the gcc that ran is MSYS2's own (the plain `gcc` package, or the "MSYS2 MSYS" shell): it targets the MSYS runtime, not Windows, and does not define `_WIN32` (#1979) | open "MSYS2 UCRT64", `pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp`, check that `gcc -dumpmachine` says `x86_64-w64-mingw32` |
+| `cannot find -lgomp` at the link | MSYS2's gcc 16 no longer pulls libgomp (#1900) | `pacman -S mingw-w64-ucrt-x86_64-libgomp` (`coli setup` lists it) |
+| `make qwen38` (or glm53, inkling, kimi_k3, olmoe, deepseek_v41) ends in `undefined reference to ...` | older tree: no bare target for that engine, make compiled the `.c` alone (#1945) | update, or name the binary: `make qwen38.exe ...` |
+| `coli setup` does not find MSYS2 installed by scoop, or uses another gcc on the PATH without Vulkan | older tree (#1900) | update, or set `MSYS2_ROOT` to the MSYS2 folder |
 | `cuda-dll ... Error 1` immediately | old tree: spaced CUDA_HOME / MSVC rejects `-Wextra` | update to current `dev` (#314) |
 | `colibri.exe is up to date` but GPU never engages | old tree: stale CPU-only binary | update to `dev`, or delete the binary and rebuild |
 | `cl.exe (MSVC) not in PATH` | built from plain PowerShell | use the x64 Native Tools prompt |
@@ -326,6 +450,90 @@ not been validated on hardware here.
 **CUDA is unaffected.** A `CUDA_DLL=1` host ignores `COLI_HIP_RUNTIME_DIR`
 entirely and keeps its existing `coli_cuda.dll` search behaviour unchanged.
 
+### How `coli plan` and `coli doctor` see an AMD GPU here
+
+`rocm-smi` is a Linux tool. Neither the Windows HIP SDK installer nor a source
+build ships it, so the ROCm discovery path used everywhere else finds nothing on
+Windows and every AMD host planned as if it had no GPU at all.
+
+**Windows AMD discovery therefore goes through `hipInfo.exe`**, which both
+shipped SDKs do provide, in the same directory as `amdhip64_7.dll`. It comes
+from the HIP environment you already installed to build the backend — no extra
+Python package, no third-party dependency.
+
+Colibri looks for it in this order, and stops at the first hit:
+
+1. **`COLI_HIP_RUNTIME_DIR`** — the directory you already point at the HIP
+   runtime. `hipInfo.exe` sits beside `amdhip64_7.dll` there, so its answer
+   describes *the runtime the engine will actually bind*.
+2. **`%HIP_PATH%\bin`** — the SDK root the HIP SDK installer sets, and the same
+   variable the Makefile derives `HIP_SDK_ROOT` from.
+3. **`PATH`**.
+
+The order matters if you have more than one HIP install, which is common: a
+stale machine-wide `HIP_PATH` should not describe your hardware through a
+runtime the engine is not going to load. No install location is hardcoded.
+
+If `hipInfo.exe` cannot be found, or fails, or prints a device block missing a
+name or a memory total, discovery reports **no device**. It never invents one,
+and never completes a partial block with zeros — a zero would read as a
+measurement.
+
+#### Reported, but not planned against — and why
+
+`hipInfo` reports the device name, `gcnArchName`, `isIntegrated`, and **both**
+`memInfo.total` and `memInfo.free`. Colibri records the identity, marks
+`isIntegrated: 1` as unified memory, and takes the total.
+
+It deliberately does **not** use `memInfo.free` as a placement budget, because
+on this hardware that figure has not been qualified as one.
+
+The Armoury Crate firmware setting on the validated host exposes a
+*shared-memory allocation* limit. Four controlled observations, each in its own
+rebooted session with everything else held constant, gave:
+
+| Armoury shared-memory limit | `memInfo.total` | `memInfo.free` | Windows visible |
+|---|---|---|---|
+| ~6 GB (UI minimum) | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~32 GB | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~64 GB | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~123 GB (UI maximum) | 93.00 GiB | 92.84 GiB | 127.15 GiB |
+
+Three settings spanning a twentyfold range produced the same reading; only the
+maximum differed. At the ~6 GB minimum the reported total was roughly **12.8×
+the configured limit**. Windows-visible physical memory was unchanged in all
+four runs, as was the 0.50 GiB dedicated frame buffer the driver reports.
+
+So the reported figure is not a simple function of the setting, and no
+slider-to-HIP-memory mapping is assumed here. Nor is it dedicated VRAM: on an
+integrated part the GPU and the host draw on one physical pool, and how much of
+what HIP advertises can actually be spent — and at what cost to the host — has
+not been measured. Sizing an expert tier from it would be a guess.
+
+Such a device is therefore carried as **identity only**: free memory is
+*unknown for planning*, which is not the same claim as "zero bytes are free".
+`coli plan`
+shows it, marked `(identity only)`, with a warning naming it, and:
+
+- the VRAM tier stays at 0
+- no `CUDA_EXPERT_GB`, `PIN_GB`, `COLI_GPU` or `COLI_CUDA` is recommended
+- `COLI_CUDA_PIPE` is not switched on
+- the bottleneck is classified exactly as it would be on a CPU-only host
+
+No system-RAM figure is substituted for the missing value either; nothing is
+fabricated in place of a measurement.
+
+None of this prevents you from running on the GPU. Every environment variable
+in this document still works exactly as documented — this governs only what
+Colibri will turn on *by itself*. Qualifying a safe automatic budget on shared
+memory needs allocation measurements on real hardware, and that is deliberately
+left to a later change rather than guessed at here.
+
+A discrete Windows AMD card is marked `unified_memory: false` from
+`isIntegrated: 0`, but is also carried as identity-only for now: there is no
+discrete Windows AMD host in this validation set, and the same guess would be
+just as unqualified there.
+
 ### Putting model tensors on the GPU — and checking that it happened
 
 `COLI_CUDA=1` initialises the backend. It does **not**, on its own, put a single
@@ -504,3 +712,27 @@ Remove-Item -Recurse -Force $tooling
 SDK paths containing spaces are supported — every SDK-derived path the recipe
 passes to the compiler is quoted. If you supply one yourself, quote it:
 `HIP_SDK_ROOT="<path with spaces>"`.
+
+## Expert readahead
+
+Expert readahead uses a bounded Windows thread-pool queue. A `WILLNEED` hint
+returns without reading the expert on the inference thread, even when the file
+was opened synchronously. The worker prefetches a read-only file mapping;
+there is no second, temporary copy of the expert. At most four hints per engine
+translation unit are pending, with each window capped at 64 MiB. Excess hints,
+unavailable APIs and failed mappings are safely skipped; ordinary model reads
+still supply the weights. This applies to the common file-advice path used by
+the CPU and GPU engines and does not change their weight formats or arithmetic.
+
+## Expert reads
+
+A shard is opened once and every thread reads that descriptor. A descriptor
+from the C runtime's `open()` is a synchronous handle, and Windows serves one
+read at a time through it whatever the thread count, so each shard also gets a
+second descriptor opened with `FILE_FLAG_OVERLAPPED`. The reader that finds the
+shard free reads through the first descriptor, as before; a reader that finds
+it taken reads through the second, where any number of reads are in flight
+together. `pread` is still a blocking call; it waits for its own read. If the
+second descriptor cannot be opened the shard keeps the one it has, and its
+reads are serialized rather than refused. This changes when the bytes are
+read, never which bytes.

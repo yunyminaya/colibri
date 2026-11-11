@@ -7,13 +7,25 @@
  */
 #include "deepseek_v4.h"
 
+#include <stdio.h>
 #include "tensor.h"
 #include "expert_store.h"
+#include "expert_store_registry.h"
 #include "native_quant.h"
 #include "native_quant_batch.h"
 #include "native_quant_dual.h"
 #include "native_quant_fp4_rows16.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+
+#include "ggml_view.h"   /* the FP8 and FP4 entries hand a GGUF matrix to coli_ggml_matmul */
+
+/* Worker count for the persistent expert-loader pool in the block pipeline
+ * (deepseek_v4_block_pipeline.c). Shared here so the CLI can size the OpenMP
+ * team around the loaders instead of scheduling compute onto their CPUs. */
+#ifndef COLI_V4_EXPERT_LOADER_COUNT
+#define COLI_V4_EXPERT_LOADER_COUNT 3
+#endif
 
 #define COLI_ST_MAX_RANK ST_MAX_RANK
 #define COLI_ST_BF16 0
@@ -67,6 +79,38 @@ int coli_st_prefetch_at(const ColiSafetensorsIndex *index, int shard,
                         uint64_t offset, size_t length);
 const char *coli_st_dtype_name(ColiSafetensorsDType dtype);
 
+/* ==== begin dual-SSD mirror (COLI_MODEL_MIRROR / SNAP_MIRROR) ==== */
+
+/* Registers the read replicas listed in COLI_MODEL_MIRROR (or SNAP_MIRROR) on
+ * `index` and derives the per-drive expert read split from COLI_DISK_WEIGHTS
+ * or a startup bandwidth probe (colibri.c mirror_setup semantics). Runs after
+ * the index is open and before any expert load. Returns 1 when a usable mirror
+ * is active, 0 when none, -1 on error. */
+int coli_st_mirror_setup(ColiSafetensorsIndex *index, const char *model_dir,
+                         int experts_per_layer);
+int coli_st_streaming_direct_available_rep(const ColiSafetensorsIndex *index,
+                                           int shard, int rep);
+
+/* Replica (0 = primary, 1..nrep-1 = mirrors) serving expert (layer, eid). */
+int coli_st_expert_route(int layer, int eid);
+int coli_st_mirror_active(void);
+int coli_st_mirror_nrep(void);
+
+/* Rep-aware reads: route to the replica fd (falling back to the primary when
+ * the shard is absent there or on read error) and account bytes per drive. */
+int coli_st_read_at_rep(const ColiSafetensorsIndex *index, int shard, int rep,
+                        uint64_t offset, size_t length, void *destination);
+int coli_st_read_at_streaming_rep(const ColiSafetensorsIndex *index, int shard,
+                                  int rep, uint64_t offset, size_t length,
+                                  void *destination);
+int coli_st_prefetch_at_rep(const ColiSafetensorsIndex *index, int shard,
+                            int rep, uint64_t offset, size_t length);
+
+/* Per-drive I/O telemetry (bytes / read count), index [0] primary, [r] mirror. */
+extern uint64_t g_v4_mir_bytes[1 + ST_MAX_MIR];
+extern uint64_t g_v4_mir_nread[1 + ST_MAX_MIR];
+/* ==== end dual-SSD mirror ==== */
+
 int coli_tensor_load_fp8(ColiOwnedTensor *output,
                          const ColiSafetensorsIndex *index,
                          const char *prefix, char *error, size_t error_size);
@@ -112,6 +156,17 @@ int coli_v4_rope_precompute(float *cosines, float *sines,
                             int original_sequence_length, float base,
                             float factor, int beta_fast, int beta_slow);
 
+int coli_v4_rope_precompute_range(float *cosines, float *sines,
+                                  int dimension, int start_position,
+                                  int sequence_length,
+                                  int original_sequence_length, float base,
+                                  float factor, int beta_fast, int beta_slow);
+
+int coli_v4_rope_position(float *cosines, float *sines,
+                          int dimension, int position,
+                          int original_sequence_length, float base,
+                          float factor, int beta_fast, int beta_slow);
+
 int coli_v4_rope_apply(float *vectors, int vector_count, int dimension,
                        const float *cosines, const float *sines, int inverse);
 
@@ -119,6 +174,10 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
                   const float *gate, const float *bias,
                   const int *forced_indices, int experts, int dimension,
                   int topk, float route_scale);
+int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
+                       const uint16_t *gate, const float *bias,
+                       const int *forced_indices, int experts, int dimension,
+                       int topk, float route_scale);
 
 int coli_v4_swiglu(float *output, const float *gate, const float *up,
                    int dimension, float limit);
@@ -151,7 +210,44 @@ typedef struct {
      * This is an in-memory execution layout only; checkpoint bytes and scales
      * remain unchanged. */
     int packed_rows8;
+    /* A GGUF index holds the tensor as another dtype the loader converts back
+     * (coli_v4_layer_plan_index): 1 = F32 values of a BF16 tensor, 2 = I32 of an I64,
+     * 3 = BF16 values written as F16, 4 = F16 of an F32 tensor, 5 = ggml blocks of an F32
+     * tensor (stored: their dtype), dequantized to F32. */
+    unsigned char convert;
+    int stored;
 } ColiDeepSeekV4TensorSpec;
+
+/* The view of a resident GGUF matrix (a ggml-typed spec, st_gguf.h): its blocks as the file
+ * has them, no scale tensor beside them. A BF16 / F32 matrix gets the same view (its ggml
+ * type), for code that takes either kind. */
+static inline int coli_v4_ggml_view(ColiTensorView *view, const void *data,
+                                    const ColiDeepSeekV4TensorSpec *spec) {
+    const int type = st_is_ggml(spec->dtype) ? st_ggml_type(spec->dtype)
+                   : spec->dtype == COLI_ST_BF16 ? GQ_BF16 : spec->dtype == COLI_ST_F32 ? GQ_F32 : -1;
+    if (type < 0) return -1;
+    const int64_t row = gq_row_bytes(type, spec->shape[1]);
+    if (!data || spec->rank != 2 || row < 0) return -1;
+    *view = (ColiTensorView){
+        COLI_TENSOR_GGML, COLI_SCALE_NONE, data, NULL, (size_t)(row * spec->shape[0]), 0,
+        spec->shape[0], spec->shape[1], 1, (uint32_t)type, NULL
+    };
+    return 0;
+}
+
+/* The type a GGUF expert matrix is held in for the CPU (coli_ggml_held_type): interleaved by
+ * 16 rows unless COLI_V4_ROWS16=0, as the FP4 experts' rows16. The device tier gets the file's
+ * rows back. */
+static inline int coli_v4_gguf_held_type(int type, int64_t rows, int64_t cols) {
+    return coli_ggml_held_type(type, rows, cols, "COLI_V4_ROWS16");
+}
+
+/* 1 when the index is a GGUF read in place (st_gguf.h): some tensor carries a ggml type. */
+static inline int coli_v4_index_gguf(const ColiSafetensorsIndex *index) {
+    for (int i = 0; index && i < index->n; i++)
+        if (st_is_ggml(index->t[i].dtype)) return 1;
+    return 0;
+}
 
 typedef struct {
     int layer;
@@ -177,11 +273,49 @@ typedef struct {
     ColiDeepSeekV4LayerPlan plan;
     ColiDeepSeekV4LayerStats stats;
     void *data[COLI_V4_MAX_LAYER_TENSORS];
+    /* Optional per-tensor backend-resident mirrors (Dsv4CudaTensor* on the CUDA
+     * tier). Aligned 1:1 with plan.tensors[]; owned by the engine's GPU tier. */
+    void *gpu[COLI_V4_MAX_LAYER_TENSORS];
+    /* Dense weights on the Vulkan device only (COLI_VK_DENSE_HOST): mapped = the tensor
+     * sits in an anonymous mapping of its own, whose pages can be given back while the
+     * address stays reserved (the device copies are looked up by it); host_gone = they
+     * were given back, the device holds the tensor alone. */
+    unsigned char mapped[COLI_V4_MAX_LAYER_TENSORS];
+    unsigned char host_gone[COLI_V4_MAX_LAYER_TENSORS];
 } ColiDeepSeekV4LayerWeights;
+
+/* The resident tensors a Vulkan device may hold alone (docs/vulkan.md, "Dense weights on
+ * the device only"): every fp8 matrix, which the CPU reads only through the native_quant
+ * entries, and the compressors' bf16 projections, which it reads only in
+ * coli_v4_compressor_step; both read a dropped tensor back first
+ * (coli_v4_layer_host_restore). Everything else stays in RAM: norms, block scales, sinks,
+ * the compressors' ape, the mHC mixes, the router and the hash router's table, the
+ * indexer's weights_proj (multiplied inline on the CPU). */
+static inline int coli_v4_dense_device_only_tensor(const ColiDeepSeekV4TensorSpec *spec) {
+    if (!spec || spec->rank != 2) return 0;
+    if (spec->dtype == COLI_ST_F8_E4M3) return 1;
+    if (spec->dtype != COLI_ST_BF16) return 0;
+    size_t n = strlen(spec->name);
+    static const char *const tail[] = {"compressor.wkv.weight", "compressor.wgate.weight"};
+    for (int k = 0; k < 2; k++) {
+        size_t t = strlen(tail[k]);
+        if (n >= t && !strcmp(spec->name + n - t, tail[k])) return 1;
+    }
+    return 0;
+}
+/* Its bytes in RAM (fp8 one a value, bf16 two). */
+static inline uint64_t coli_v4_dense_tensor_bytes(const ColiDeepSeekV4TensorSpec *spec) {
+    uint64_t count = 1;
+    for (int axis = 0; axis < spec->rank; axis++) count *= (uint64_t)spec->shape[axis];
+    return spec->dtype == COLI_ST_BF16 ? count * 2 : count;
+}
 
 int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
                        const ColiDeepSeekV4Config *config, int layer,
                        char *error, size_t error_size);
+/* Fit a plan to what a GGUF index holds (st_gguf.h); a safetensors one comes back as it is. */
+int coli_v4_layer_plan_index(ColiDeepSeekV4LayerPlan *plan,
+                             const ColiSafetensorsIndex *index);
 int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
                            const ColiSafetensorsIndex *index,
                            ColiDeepSeekV4LayerStats *stats,
@@ -196,6 +330,37 @@ void coli_v4_layer_free(ColiV4Engine *engine,
 const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
                                const char *name,
                                const ColiDeepSeekV4TensorSpec **spec);
+
+/* Dense weights on the Vulkan device only. The engine binary built with VK=1 sets these
+ * pointers; every other link sees NULL and keeps its dense layers in RAM.
+ *   coli_v4_dense_device_decide: asked by the RAM plan (EXPERT_STORE_AUTO) once it has
+ *     measured the memory, with the bytes the device would hold and the RAM it would give
+ *     back; 1 = the dense layers live on the device, their droppable tensors out of RAM.
+ *     It sets dense_resident.device_layers: only those first layers go (a partial chain
+ *     takes a prefix of the layers), and the plan counts only their bytes out of RAM.
+ *   coli_v4_dense_place: after a resident layer is read, its tensors to the device and
+ *     the droppable ones' pages given back (coli_v4_layer_host_drop).
+ *   coli_v4_dense_device_lost: 1 once the device is gone; resident layers are then read
+ *     per forward as a low-memory plan reads them. */
+typedef int (*ColiV4DenseDeviceDecide)(ColiV4Engine *engine, uint64_t device_bytes,
+                                       uint64_t host_bytes);
+extern ColiV4DenseDeviceDecide coli_v4_dense_device_decide;
+extern int (*coli_v4_dense_place)(ColiV4Engine *engine, int layer);
+extern int (*coli_v4_dense_device_lost)(void);
+/* A droppable tensor read again from disk per forward after the device was lost (bytes). */
+extern void (*coli_v4_dense_reread)(uint64_t bytes);
+/* Gives back the pages of resident tensor i of a layer (mapped, droppable); 0 on success. */
+int coli_v4_layer_host_drop(ColiV4Engine *engine, int layer, size_t i);
+/* Reads back from disk the dropped tensor that holds `data`, at its own address: 1 and
+ * its bytes when it did, 0 when `data` is in no dropped tensor, -1 on a read failure. */
+int coli_v4_layer_host_restore(ColiV4Engine *engine, const void *data, uint64_t *bytes);
+
+/* Backend-mirror accessors: the gpu handle attached to the tensor named
+ * "layers.<N>.<suffix>.weight", or NULL when the tier did not upload it. */
+void *coli_v4_layer_gpu(const ColiDeepSeekV4LayerWeights *weights,
+                        const char *suffix);
+int coli_v4_layer_gpu_set(ColiDeepSeekV4LayerWeights *weights,
+                          const char *suffix, void *handle);
 
 #ifdef __cplusplus
 }
@@ -292,6 +457,10 @@ extern "C" {
 typedef struct ColiDeepSeekV4WindowAttentionState
     ColiDeepSeekV4WindowAttentionState;
 
+int coli_v4_window_attention_prepare(ColiDeepSeekV4WindowAttentionState *state,
+                                     const ColiDeepSeekV4LayerWeights *weights,
+                                     const ColiDeepSeekV4Config *config,
+                                     char *error, size_t error_size);
 int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **state,
                                     const ColiDeepSeekV4Config *config);
 void coli_v4_window_attention_reset(ColiDeepSeekV4WindowAttentionState *state);
@@ -339,6 +508,12 @@ int coli_v4_attention_snapshot_restore(
     ColiDeepSeekV4WindowAttentionState *state,
     const ColiV4AttentionSnapshot *snapshot);
 void coli_v4_attention_snapshot_destroy(ColiV4AttentionSnapshot *snapshot);
+/* Disk (de)serialization of a snapshot (little-endian raw fields + arrays).
+ * write returns 0 on success; read allocates *output (0 on success). */
+int coli_v4_attention_snapshot_write(const ColiV4AttentionSnapshot *snapshot,
+                                     FILE *stream);
+int coli_v4_attention_snapshot_read(FILE *stream,
+                                    ColiV4AttentionSnapshot **output);
 /* ==== end deepseek_v4_attention_transaction.h ==== */
 
 /* ==== begin deepseek_v4_compressor.h ==== */
@@ -383,6 +558,14 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
                             const float *input, int position,
                             char *error, size_t error_size);
 
+/* Like coli_v4_compressor_step, but consumes precomputed wkv/wgate matvec
+ * rows (projection_dim floats each, e.g. batched on the GPU) instead of
+ * projecting input itself. State updates are identical. */
+int coli_v4_compressor_advance(ColiDeepSeekV4CompressorState *state,
+                               float *output, int *produced,
+                               const float *kv_proj, const float *gate_proj,
+                               int position, char *error, size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif
@@ -401,6 +584,10 @@ int coli_v4_compressor_snapshot_restore(
     ColiDeepSeekV4CompressorState *state,
     const ColiV4CompressorSnapshot *snapshot);
 void coli_v4_compressor_snapshot_destroy(ColiV4CompressorSnapshot *snapshot);
+int coli_v4_compressor_snapshot_write(const ColiV4CompressorSnapshot *snapshot,
+                                      FILE *stream);
+int coli_v4_compressor_snapshot_read(FILE *stream,
+                                     ColiV4CompressorSnapshot **output);
 /* ==== end deepseek_v4_compressor_snapshot.h ==== */
 
 /* ==== begin deepseek_v4_indexer.h ==== */
@@ -428,6 +615,24 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
                          int index_capacity, const float *query_rank,
                          const float *input, int position,
                          char *error, size_t error_size);
+/* Like coli_v4_indexer_step, but consumes precomputed rows of the indexer
+ * compressor's wkv/wgate projections for this position. */
+int coli_v4_indexer_step_projected(ColiDeepSeekV4Indexer *state, int *indices,
+                                   int index_capacity, const float *query_rank,
+                                   const float *input, int position,
+                                   const float *kv_proj, const float *gate_proj,
+                                   char *error, size_t error_size);
+/* Batched prefill split of the step: advance per token (in order), then
+ * select for the whole chunk at once. */
+int coli_v4_indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
+                            int position, const float *kv_proj,
+                            const float *gate_proj, char *error,
+                            size_t error_size);
+int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
+                                 int index_capacity, const float *query_ranks,
+                                 const float *inputs, int start_position,
+                                 int batch, const int *counts, int *selected,
+                                 char *error, size_t error_size);
 const float *coli_v4_indexer_compressed_values(
     const ColiDeepSeekV4Indexer *state);
 int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state);
@@ -444,6 +649,9 @@ int coli_v4_indexer_snapshot_create(const ColiDeepSeekV4Indexer *state,
 int coli_v4_indexer_snapshot_restore(ColiDeepSeekV4Indexer *state,
                                      const ColiV4IndexerSnapshot *snapshot);
 void coli_v4_indexer_snapshot_destroy(ColiV4IndexerSnapshot *snapshot);
+int coli_v4_indexer_snapshot_write(const ColiV4IndexerSnapshot *snapshot,
+                                   FILE *stream);
+int coli_v4_indexer_snapshot_read(FILE *stream, ColiV4IndexerSnapshot **output);
 /* ==== end deepseek_v4_indexer_snapshot.h ==== */
 
 /* ==== begin deepseek_v4_expert.h ==== */
@@ -457,6 +665,15 @@ extern "C" {
 int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
                                const float *input, float route_weight,
                                float swiglu_limit);
+
+/* Batch-major routed-expert forward.  The row-major FP4 path streams each
+ * matrix once for all items; unsupported packed layouts fall back to the
+ * scalar entry point without changing its numerical contract. */
+int coli_v4_expert_forward_batch_ref(float *outputs,
+                                     const ColiExpertView *expert,
+                                     const float *inputs,
+                                     const float *route_weights,
+                                     int batch, float swiglu_limit);
 
 int coli_v4_shared_expert_forward_ref(float *output,
                                       const ColiTensorView *gate,
@@ -481,7 +698,7 @@ int coli_v4_shared_expert_forward_ref(float *output,
 extern "C" {
 #endif
 
-typedef struct {
+typedef struct ColiDeepSeekV4ExpertStoreOptions {
     const char *model_dir;
     int layers;
     int experts_per_layer;
@@ -489,6 +706,12 @@ typedef struct {
     /* Optional hot-pin policy (-1 / 0 => implementation default). */
     int pin_slots_per_layer;
     uint64_t repin_interval;
+    /* Internal range executors must not benchmark arbitrary bytes from a
+     * complete checkpoint while opening one layer slice. */
+    int skip_mirror_setup;
+    /* The RAM the plan keeps for the system: filling the cache before the first
+     * request stops short of taking free memory below it (0: no such check). */
+    uint64_t keep_free_bytes;
 } ColiDeepSeekV4ExpertStoreOptions;
 
 int coli_deepseek_v4_expert_store_open(
@@ -496,6 +719,128 @@ int coli_deepseek_v4_expert_store_open(
     ColiExpertStore **store,
     char *error,
     size_t error_size);
+/* Reads into the cache, before the first request, every expert its slots hold, or
+ * with fewer slots each layer's most used ones in the history (#2109). Counts no
+ * use; runs once per store. Returns the experts it could not read. */
+int coli_v4_expert_store_prewarm(ColiExpertStore *store);
+
+/* Plain SSD implementation underneath the optional hot-row/autopin wrapper.
+ * Segment adapters use it so opening a layer range never warms experts from
+ * layers outside that range.  It remains an internal symbol, not public ABI. */
+int coli_deepseek_v4_expert_store_open_base(
+    const ColiDeepSeekV4ExpertStoreOptions *options,
+    ColiExpertStore **store,
+    char *error,
+    size_t error_size);
+
+/* Batched CPU prefill only: `layer` borrows the complete expert-cache pool;
+ * a negative value restores ordinary per-layer miss allocation for decode.
+ * Alternative registered ExpertStore backends safely ignore the request. */
+void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
+
+/* The CUDA expert bank (COLI_CUDA_MOE_BATCH=1 prefill) reads through
+ * lookup_uncounted, a lookup that leaves the routing books alone, and keeps the
+ * books for one chunk's routing on `layer` (`count` expert ids, each token's
+ * top-k as the router returned them): each member of its union once, in
+ * ascending order as the CPU union looks them up. touch_union, before the
+ * bank's reads, gives the members the RAM cache holds the recency touch a hit
+ * gives; note_union, once the chunk is done, counts each member the way a
+ * lookup counts it. Neither leases, reads, inserts nor evicts. Another
+ * ExpertStore backend gets a plain lookup and no books. */
+int coli_v4_expert_store_lookup_uncounted(ColiExpertStore *store,
+                                          ColiExpertKey key,
+                                          ColiExpertView *view);
+void coli_v4_expert_store_touch_union(ColiExpertStore *store, int layer,
+                                      const int *ids, int count);
+void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
+                                     const int *ids, int count);
+
+/* Exclusive RAM/VRAM (vk_tier.h's vkt_ram_first): when set, a full RAM cache gives up
+ * first a slot whose expert the device holds, and reports it through ram_gave. The
+ * store's eviction reads them in every build; only a Vulkan one sets them. */
+extern int (*coli_v4_expert_store_ram_first)(int layer, int expert);
+extern void (*coli_v4_expert_store_ram_gave)(void);
+
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* The routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1; cu_tier.c on a CUDA device). The MoE
+ * units reach it through this table, which the engine's own unit fills when
+ * COLI_VULKAN=1 started the tier (GENERATE_STATS, the one unit that links the
+ * backend); it stays NULL in every other link of the units, the parent's tests
+ * among them. The tier serves `store` only, from the engine thread only:
+ *   issue  x[S][hidden] already rounded to E4M3 per 128, idx/w[S*K] the routing
+ *          and its weights; returns how many (s, k) the device took (taken[]);
+ *   join   the taken rows, f32 (the caller rounds each to bf16); 0 = recompute
+ *          them on the CPU;
+ *   note   an expert the CPU computed, as the store lent it (rows16 or not);
+ *   routed a routing the device served: counted as a store lookup counts one. */
+typedef struct {
+    ColiExpertStore *store;
+    int (*issue)(int layer, const float *x, int S, int K, const int *idx, const float *w,
+                 uint8_t *taken);
+    int (*join)(const float **rows);
+    void (*note)(const ColiExpertView *view);
+    void (*routed)(ColiExpertKey key);
+} ColiV4VkTier;
+extern const ColiV4VkTier *coli_v4_vk_tier;
+
+/* The hot store's side of the tier (no-ops on another ExpertStore backend):
+ * count a routing the device served (pin ranking, HITS and EMAP heat, the
+ * .coli_usage history), its history as [layers][experts] counts, whether an
+ * expert sits in the RAM cache now, and one expert read from disk into `buffer`
+ * (record_bytes + 8192 bytes, 4096-aligned), outside the cache and its books,
+ * row-major. device_tier, when set, marks an expert the device holds as tier 2
+ * in EMAP. */
+void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key);
+uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store);
+int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key);
+uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
+/* A GGUF store's experts at `layer` (st_gguf.h): 1 with the ggml types of gate (w1), up
+ * (w3) and down (w2) as the file has them, *mx = 1 when the store lays them out as the
+ * checkpoint's FP4 (all three MXFP4); 0 for a checkpoint's store, -1 without one. */
+int coli_v4_expert_store_gguf_form(ColiExpertStore *store, int layer, int types[3], int *mx);
+int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
+                                      unsigned char *buffer, ColiExpertView *view);
+extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
+
+#endif /* COLI_VULKAN || COLI_CUDA */
+#ifdef COLI_VULKAN
+/* The dense chain (deepseek_v4_chain.h, COLI_VK_CHAIN): a layer's attention state as its
+ * units keep it, so the chain can mirror it on the device and write back what a forward
+ * changed, as the CPU would have left it. The views point into the live state.
+ *   attention  the window ring [window][head_dim] (position % window), the compressed
+ *              rows [capacity][head_dim] and their count, the compressor and the
+ *              indexer (NULL on a layer without them, or before the layer first ran:
+ *              coli_v4_window_attention_prepare makes them);
+ *   compressor its ring: kv and score rows [rows][projection] (rows = ratio, twice that
+ *              with the overlap of ratio 4; projection = head_dim, twice that likewise);
+ *   indexer    its keys [capacity][head_dim] and their count, and its compressor.
+ * reserve makes room for `rows` rows (the contents kept, the count untouched); set_count
+ * sets the count (at most the capacity). */
+typedef struct {
+    float *kv, *compressed;
+    int window, head_dim, ratio, compressed_count, compressed_capacity;
+    ColiDeepSeekV4CompressorState *compressor;
+    ColiDeepSeekV4Indexer *indexer;
+} ColiV4AttentionView;
+int coli_v4_attention_view(ColiDeepSeekV4WindowAttentionState *state, ColiV4AttentionView *view);
+int coli_v4_attention_reserve(ColiDeepSeekV4WindowAttentionState *state, int rows);
+int coli_v4_attention_set_count(ColiDeepSeekV4WindowAttentionState *state, int count);
+typedef struct { float *kv, *score; int rows, projection, ratio, head_dim, rotate_fp4; } ColiV4CompressorView;
+int coli_v4_compressor_view(ColiDeepSeekV4CompressorState *state, ColiV4CompressorView *view);
+typedef struct { float *keys; int count, capacity, head_dim; ColiDeepSeekV4CompressorState *compressor; } ColiV4IndexerView;
+int coli_v4_indexer_view(ColiDeepSeekV4Indexer *state, ColiV4IndexerView *view);
+int coli_v4_indexer_reserve(ColiDeepSeekV4Indexer *state, int rows);
+int coli_v4_indexer_set_count(ColiDeepSeekV4Indexer *state, int count);
+/* The MoE of `rows` normalized FFN rows without the shared expert: each row's routed
+ * experts summed in the CPU block's order (the store, the Vulkan tier), the sum left as
+ * it stands before the CPU adds the shared expert and rounds; the chain adds the shared
+ * expert it ran on the device. tokens: the rows' ids (the hash router). 0, or -1 with
+ * the reason in error. */
+int coli_v4_moe_routed(float *routed, const ColiDeepSeekV4LayerWeights *weights,
+                       const ColiDeepSeekV4Config *config, ColiExpertStore *store,
+                       const float *inputs, const int *tokens, int rows,
+                       char *error, size_t error_size);
+#endif
 
 #ifdef __cplusplus
 }
@@ -545,6 +890,13 @@ int coli_v4_block_window_batch_ref(
     const ColiDeepSeekV4LayerWeights *weights,
     const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
     const float *inputs_hc, const int *tokens, int start_position, int batch,
+    char *error, size_t error_size);
+/* rows of several conversations, each with its attention state and position */
+int coli_v4_block_window_rows_ref(
+    float *outputs_hc, ColiDeepSeekV4WindowAttentionState **attention,
+    const ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
+    const float *inputs_hc, const int *tokens, const int *positions, int batch,
     char *error, size_t error_size);
 /* ==== end deepseek_v4_block_batch.h ==== */
 
@@ -603,9 +955,10 @@ int coli_v4_resident_tier_plan(
 #include <stddef.h>
 #include <stdint.h>
 
-int coli_v4_head_cache_probe(const char *model_dir, uint64_t *bytes,
+int coli_v4_head_cache_probe(const ColiSafetensorsIndex *index, uint64_t *bytes,
                              char *error, size_t error_size);
-int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
+int coli_v4_head_cache_load(ColiV4Engine *engine,
+                            const ColiSafetensorsIndex *index,
                             char *error, size_t error_size);
 uint64_t coli_v4_head_cache_bytes(const ColiV4Engine *engine);
 const void *coli_v4_head_cache_data(const ColiV4Engine *engine,
@@ -627,6 +980,134 @@ typedef struct {
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS = 128 };
 
+/* engine open: seconds spent building target_index (printed by the auto
+ * store planner as the v4_open line). Defined in the engine unit. */
+extern double g_v4_open_index_seconds;
+
+#ifdef COLI_V4_GPU_TIER
+/* Provided by the COLI_V4_UNIT_GPU translation unit. Compiled in only on the
+ * Windows CUDA build; every call site elsewhere is guarded by COLI_V4_GPU_TIER
+ * so non-GPU objects never reference these symbols. */
+int coli_v4_gpu_engine_open(ColiV4Engine *engine);
+void coli_v4_gpu_engine_close(ColiV4Engine *engine);
+int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
+                             ColiDeepSeekV4LayerWeights *weights);
+int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
+                           const float *input);
+int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
+                                 const float *inputs, int batch);
+int coli_v4_gpu_kv_ring_append(const ColiDeepSeekV4LayerWeights *weights,
+                               const float *rows, int start_pos, int count,
+                               int window, int dim);
+int coli_v4_gpu_kv_comp_append(const ColiDeepSeekV4LayerWeights *weights,
+                               const float *rows, int start_idx, int count,
+                               int dim);
+int coli_v4_gpu_kv_cache_sync(const ColiDeepSeekV4LayerWeights *weights,
+                              const float *cpu_ring, int window, int head_dim,
+                              int start_position, const float *compressed,
+                              int comp_total);
+void coli_v4_gpu_kv_cache_advance(const ColiDeepSeekV4LayerWeights *weights,
+                                  const float *rows, int start_position,
+                                  int count, int window, int head_dim,
+                                  int comp_total);
+void coli_v4_gpu_kv_cache_poison(const ColiDeepSeekV4LayerWeights *weights);
+void coli_v4_gpu_kv_cache_invalidate_all(void);
+int coli_v4_gpu_sparse_attention_batch_cached(
+    const ColiDeepSeekV4LayerWeights *weights, float *attended,
+    const float *q, const float *chunk, int chunk_start, const float *sinks,
+    const int *meta, int abs_base, int comp_limit, int heads, int head_dim,
+    int batch);
+int coli_v4_gpu_fp8_ref_matmul(const ColiDeepSeekV4LayerWeights *weights,
+                               const ColiTensorView *w, const float *x_qdq,
+                               int tokens, float *y);
+int coli_v4_gpu_indexer_score_batch(
+    const ColiDeepSeekV4LayerWeights *weights, float *scores,
+    const float *queries, const float *keys, const float *head_w,
+    const int *counts, int tokens, int heads, int dim, int count);
+int coli_v4_gpu_sparse_attention_batch_cached_idx(
+    const ColiDeepSeekV4LayerWeights *weights, float *attended,
+    const float *q, const float *chunk, int chunk_start, const float *sinks,
+    const int *meta, const int *sel, int selstride, int abs_base,
+    int comp_limit, int heads, int head_dim, int batch);
+int coli_v4_gpu_moe_batch_wanted(void);
+void coli_v4_gpu_moe_batch_release(void);
+void coli_v4_gpu_moe_batch_hint(int total_fresh_tokens);
+void coli_v4_gpu_moe_batch_prefill(int prefill);
+int coli_v4_gpu_moe_batch_union(float *outputs,
+                                const ColiDeepSeekV4LayerWeights *weights,
+                                const ColiDeepSeekV4Config *config,
+                                ColiExpertStore *store,
+                                const float *inputs, const int *tokens,
+                                int batch);
+int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
+                               const float *input, int groups);
+/* Batched GPU attention offloads for prefill (COLI_CUDA_ATTN_BATCH=1).
+ * Every entry returns non-zero on any refusal so the caller can fall back to
+ * the CPU reference for the whole chunk. */
+int coli_v4_gpu_attn_batch_wanted(void);
+extern int coli_v4_gpu_attn_default;   /* COLI_CUDA_ATTN_BATCH unset: on for a GGUF on the CUDA tier */
+/* Runs both bf16 projection matrices (wkv_key/wgate_key mirrors) over the
+ * whole chunk: kv_proj/gate_proj receive [batch][rows-of-mirror]. */
+int coli_v4_gpu_compressor_project_batch(
+    const ColiDeepSeekV4LayerWeights *weights, const char *wkv_key,
+    const char *wgate_key, int expected_rows, float *kv_proj,
+    float *gate_proj, const float *inputs, int batch);
+/* Sparse window attention over a linear KV slab; contract described at
+ * dsv4_cuda_sparse_attn_batch. */
+int coli_v4_gpu_sparse_attention_batch(
+    const ColiDeepSeekV4LayerWeights *weights, float *attended,
+    const float *q, const float *values, const float *sinks, const int *meta,
+    int value_rows, int comp_base, int heads, int head_dim, int batch);
+/* Grouped wo_a + wo_b over the whole chunk through the fp8-bf16 wo_a mirror.
+ * q_width = heads*head_dim (context row), hidden = output row. */
+int coli_v4_gpu_attention_wo_batch(
+    const ColiDeepSeekV4LayerWeights *weights, float *outputs,
+    const float *attended, int groups, int q_width, int hidden, int batch);
+/* Batched mHC: whole-chunk normalized_hc_pre / coli_v4_hc_post through the
+ * hc_<branch>_fn/scale/base and norm f32 mirrors (hc must be 4, hidden 4096).
+ * posts is [batch][hc], combs [batch][hc*hc]; layouts match the CPU arrays. */
+int coli_v4_gpu_mhc_pre_norm_batch(
+    const ColiDeepSeekV4LayerWeights *weights, const char *branch,
+    const char *norm_key, float *posts, float *combs, float *normalized,
+    const float *inputs_hc, int hc, int hidden, int batch);
+int coli_v4_gpu_mhc_post_batch(
+    const ColiDeepSeekV4LayerWeights *weights, float *outputs_hc,
+    const float *branch, const float *residual_hc, const float *posts,
+    const float *combs, int hc, int hidden, int batch);
+/* MoE router offload: mirrors the bf16 route contract of coli_v4_route_bf16.
+ * Uses the resident layer's uploaded f32 gate/bias mirrors through
+ * dsv4_cuda_route (which hardcodes 256 experts / top-k 6); any shape or
+ * mirror mismatch returns non-zero so the caller falls back to the CPU route. */
+int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
+                      const ColiDeepSeekV4LayerWeights *weights,
+                      const float *bias, const int *forced_indices,
+                      int experts, int dimension, int topk, float route_scale);
+/* Best-effort fp4 mirror attach for a routed expert. Returns 0 when all three
+ * of view->gate/up/down now carry Dsv4CudaTensor* handles (cached on first
+ * use), non-zero when the tier is inactive or the expert must stay on the CPU
+ * fp4 path. Only block_rows==1 views are mirrored; rows16-packed slots are
+ * skipped. */
+int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
+/* lookup-only twin: reports residency, never uploads (hybrid q* split) */
+int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
+/* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
+ * unit, read by the serve unit's per-turn stderr line. */
+int coli_v4_hybrid_enabled(void);
+/* async attach (enqueue only; drain closes the pipeline before compute) */
+int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
+                                    ColiExpertView *view);
+int coli_v4_gpu_expert_drain(ColiExpertStore *store);
+extern double g_v4_hyb_fill_bw, g_v4_hyb_host_bw;
+extern unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
+extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
+/* Dspark (MTP) resident-expert mirrors: a separate bounded LRU so drafting can
+ * never evict the target model's learned expert mirrors. ensure() lazily
+ * allocates the cache on the first V4_MTP_GPU=1 draft; attach mirrors one
+ * block_rows==1 fp4 expert view into it (returns non-zero to stay on CPU). */
+int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine);
+int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view);
+#endif
+
 struct ColiV4Engine {
     ColiDeepSeekV4Config config;
     ColiDeepSeekV4RuntimeOptions runtime;
@@ -644,7 +1125,30 @@ struct ColiV4Engine {
         unsigned char ready[COLI_V4_RESIDENT_MAX_LAYERS];
         const ColiSafetensorsIndex *index;
         uint64_t total_bytes;
+        /* COLI_VK_DENSE_HOST: the layers' droppable tensors on the Vulkan device only
+         * (the plan left them out of RAM); what the device holds and what RAM gave back */
+        int device_only;
+        uint64_t device_bytes, dropped_bytes;
+        /* the layers whose droppable tensors the device holds alone: the first
+         * device_layers (a partial chain, docs/vulkan.md "A partial chain"); the others
+         * keep their host copies. Set by coli_v4_dense_device_decide, lowered when a
+         * layer does not reach the device. */
+        int device_layers;
     } dense_resident;
+    /* Optional CUDA tier (compiled in only when the engine build defines
+     * COLI_V4_GPU_TIER on Windows). enabled is 1 only after the loader resolved
+     * coli_cuda_dsv4.dll and dsv4_cuda_init succeeded; matvec dispatch then
+     * short-circuits the dense fp8 projections through backend_cuda_dsv4.cu. */
+    struct {
+        int enabled;
+        int device;
+        unsigned char layer_ready[COLI_V4_RESIDENT_MAX_LAYERS];
+        long long uploaded_bytes;
+        /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft
+         * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
+         * unless V4_MTP_GPU=1 and the tier opened successfully. */
+        void *dspark_mirrors;
+    } gpu;
     struct {
         uint16_t *markov_w1;
         uint16_t *markov_w2;
@@ -666,6 +1170,7 @@ void coli_v4_engine_detach_session(ColiV4Engine *engine);
 
 #include "tok.h"
 #include "kv_prefix.h"
+#include "park.h"   /* the conditions a short request parks a conversation on (COLI_PARK) */
 
 struct ColiV4Session {
     ColiV4Engine *engine;
@@ -694,11 +1199,40 @@ struct ColiV4Session {
     uint64_t spec_drafted;
     uint64_t spec_accepted;
     int spec_disabled;
+    /* Prompt-end capture for SUBMIT pin=1: the ids fed and the head scores
+     * that predict the token after them. A later prompt that starts with
+     * exactly these ids gets its first fresh token's predictor from here; that
+     * token is the one a closed-set caller asks about (docs/systemone.md). The
+     * attention state itself goes to a v4_ckpt slot; this is the part the
+     * snapshot does not hold. */
+    int *pin_ids;
+    int pin_len;
+    float *pin_scores;
+    /* Scratch for the numeric channel, one hidden row and one row of head
+     * scores, allocated on first use and freed with the session so the many
+     * early returns of generate() leave nothing behind. */
+    float *echo_hidden;
+    float *echo_scores;
+    /* A request started with prefill_only (a multiplexed serve, KV_SLOTS): where
+     * its decoding stands, for coli_v4_sessions_step to go on from. */
+    struct {
+        int current, last, count, max_new, done, logprobs;
+        float logit;
+        double first_at;
+        ColiV4SessionTokenFn on_token;
+        void *user_data;
+        ColiV4SessionScoresFn on_scores;
+        void *scores_user_data;
+    } mux;
 };
 
-/* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap). */
+/* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap).
+ * `config` is the model geometry (== engine->config on the engine_open path);
+ * it is forwarded by the backend registry so engine-less callers (the standalone
+ * CLI) can use routed backends that only need geometry, not the engine. */
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
+    const ColiDeepSeekV4Config *config,
     const ColiDeepSeekV4ExpertStoreOptions *options,
     ColiExpertStore **store,
     char *error,
@@ -721,6 +1255,24 @@ int coli_st_read_at_engine(ColiV4Engine *engine,
 extern int coli_v4_test_fail_expert_store_open;
 extern int coli_v4_test_skip_expert_store_open;
 extern int coli_v4_test_closed_owned_index;
+extern void (*coli_v4_test_expert_read_hook)(ColiExpertKey key);
+extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
+extern uint64_t coli_v4_test_fp4_batch_calls;
+extern uint64_t coli_v4_test_expert_victim_probes;
+int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key);
+/* One layer's routing books: usage, HITS and heat per expert, the request
+ * clock and the active pins (-1 past the pin ramp); returns the pin slot count
+ * (-1: not the hot store). */
+int coli_v4_test_expert_books(ColiExpertStore *store, int layer,
+                              uint64_t *usage, unsigned char *hit,
+                              unsigned char *heat, uint64_t *requests,
+                              int *pins);
+void coli_v4_test_reset_direct_io_stats(void);
+uint64_t coli_v4_test_direct_reads(void);
+uint64_t coli_v4_test_direct_fallbacks(void);
+/* Point missing O_DIRECT twins at a dup of the buffered fd so tests can
+ * exercise the direct-window path on filesystems that refuse O_DIRECT. */
+int coli_v4_test_force_streaming_direct(ColiExpertStore *store);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);

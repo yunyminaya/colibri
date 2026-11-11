@@ -55,12 +55,13 @@
 #include <string.h>
 #include <stdint.h>
 #include "compat.h"                    /* rename() -> MoveFileEx on Windows; see above */
+#include "own_file.h"                  /* the history may sit in a downloaded model dir */
 
 #define RT_FORMAT_VERSION 1
 #define RT_IKU1_MAGIC 0x31554B49u      /* "IKU1" — inkling.c's usage_save/pins_load */
 
 /* engines that write this format; the table exists so a mismatch names both sides */
-static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", NULL };
+static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", "deepseek_v4", "qwen38", "glm53", "qwen36", NULL };
 
 static uint32_t rt_hash(const char *s){        /* FNV-1a 32, stable across builds */
     uint32_t h = 2166136261u;
@@ -115,6 +116,18 @@ static uint32_t  *rt_counts(int layer){
     return (rt_c && layer >= 0 && layer <= rt_nl) ? rt_c[layer] : NULL;
 }
 static int rt_tracing(void){ return rt_fp != NULL; }
+
+/* Long-lived Segment hosts already own model-specific teardown, while the
+ * standalone engines historically relied on process exit.  New engines can
+ * use this explicit cleanup so sanitizer runs also cover a complete lifecycle. */
+static void rt_destroy(void){
+    if(rt_fp){ fclose(rt_fp); rt_fp = NULL; }
+    if(rt_c){
+        for(int i = 0; i <= rt_nl; i++) free(rt_c[i]);
+        free(rt_c);
+    }
+    rt_c = NULL; rt_nl = -1; rt_ne = 0; rt_id = 0; rt_engine = ""; rt_call = 0;
+}
 
 /* Release a layer's counter row, so rt_counts(layer) is NULL for a layer that does not
  * route. rt_init cannot know which those are — an engine learns its own sparsity while it
@@ -319,8 +332,16 @@ static void rt_decay(void){
     }
 }
 
+/* USAGE_SAVE=0 is a read-only run: the history is loaded but never written back (#1039).
+ * Answered here so every engine reads the switch the same way. */
+static int rt_save_enabled(void){
+    const char *sv = getenv("USAGE_SAVE");
+    return !(sv && atoi(sv)==0);
+}
+
 static int rt_save(const char *path, int quiet){
     if(!rt_c || !path || !*path) return 0;
+    if(!rt_save_enabled()) return 1;   /* a requested skip is a success, not a save failure */
     rt_decay();
     int64_t tot = 0, nz = 0;
     for(int i = 0; i <= rt_nl; i++){
@@ -328,8 +349,24 @@ static int rt_save(const char *path, int quiet){
         for(int e = 0; e < rt_ne; e++) if(rt_c[i][e]){ tot += rt_c[i][e]; nz++; }
     }
     char tmp[2100];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE *f = fopen(tmp, "w");
+    /* Truncation here is not cosmetic: fopen/rename below would then write and land on a
+     * DIFFERENT path than the caller asked for, silently, with no indication the intended
+     * history was never touched. Refuse instead of truncating. A NEGATIVE return
+     * (encoding error) is the same hazard in a worse coat: C leaves tmp indeterminate,
+     * so proceeding would fopen whatever bytes happen to be there. Same refusal path. */
+    int tl = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (tl < 0 || tl >= (int)sizeof(tmp)) {
+        if (!quiet) {
+            if (tl < 0) fprintf(stderr, "[STATS] snprintf error building temp path, not saved: %s\n", path);
+            else        fprintf(stderr, "[STATS] path too long (>%d bytes), not saved: %s\n",
+                                (int)sizeof(tmp) - 5, path);
+        }
+        return 0;
+    }
+    /* Never through a link planted in the model dir. The temp name is ours, so whatever
+     * else sits there is removed (the link, never its target) and the open retried. */
+    FILE *f = coli_own_fopen(tmp, "w");
+    if(!f && (errno == ELOOP || errno == EINVAL) && remove(tmp) == 0) f = coli_own_fopen(tmp, "w");
     if(!f){ if(!quiet) perror(tmp); return 0; }
     /* An all-zero history stays a ZERO-BYTE file, the way it was before this header
      * existed. PIN=auto decides whether a history is usable by testing the file SIZE and
@@ -344,7 +381,11 @@ static int rt_save(const char *path, int quiet){
                 if(rt_c[i][e]) fprintf(f, "%d %d %u\n", i, e, rt_c[i][e]);
         }
     }
-    fclose(f);
+    /* Buffered writes may fail only during close (for example a full disk).
+     * Publish only a complete history, keeping the previous one on failure. */
+    int write_failed = ferror(f);
+    if(fclose(f) != 0) write_failed = 1;
+    if(write_failed){ remove(tmp); return 0; }
     if(rename(tmp, path) != 0) return 0;
     if(!quiet) fprintf(stderr, "[STATS] %lld selections across %lld distinct experts -> %s\n",
                        (long long)tot, (long long)nz, path);
@@ -373,9 +414,10 @@ static int rt_save(const char *path, int quiet){
  * colibri.c has carried this guard as a private router_best_or_fallback() since
  * that test was written. inkling.c, kimi_k3.c and olmoe.c never received it --
  * the recurring shape of defects in this tree, a fix that lands in one engine
- * and not its siblings. It lives here now because route_trace.h is the one
- * header all four engines already include, and because "which expert did we
- * pick" is exactly what this file is about.
+ * and not its siblings. It lives here now because route_trace.h was the one
+ * header all four original engines already included (newer integrated engines
+ * inherit it too), and because "which expert did we pick" is exactly what this
+ * file is about.
  *
  * Degrading deterministically (to kk, the slot's own index) keeps the selection
  * reproducible and in range; the warning fires once so a poisoned tile is
@@ -391,5 +433,53 @@ static int rt_router_pick(int best, int kk, int experts, int layer) {
     }
     return kk < experts ? kk : 0;
 }
+
+/* ---- SIGTERM in serve mode: reach rt_save instead of dying before it -------
+ *
+ * The expert history is written once, after the serve loop returns. A server
+ * is not stopped that way: `kill <pid>`, `systemctl stop` and launchd all send
+ * SIGTERM, whose default action kills the process outright. The loop never
+ * returns, rt_save never runs, and a long serving session contributes nothing
+ * to the learned cache -- while one-shot chat mode, which exits on stdin EOF,
+ * saves normally. So the data is collected and then thrown away, which is the
+ * worst of both. Reported in #1629.
+ *
+ * The fix is not a save inside the handler. rt_save() allocates and writes a
+ * file, neither of which is async-signal-safe, and doing it from a handler
+ * that can fire in the middle of the very structures it serialises is how a
+ * good history file becomes a corrupt one. The handler only raises a flag and
+ * lets the blocking read fail; the loop then exits through the SAME path as
+ * stdin EOF, and the existing save at the bottom of main() runs on a quiet
+ * process.
+ *
+ * NO SA_RESTART, deliberately. The serve loop blocks in fgets/getline waiting
+ * for the next request. With SA_RESTART the read silently resumes after the
+ * handler returns, the flag is set and never looked at again, and
+ * `systemctl stop` hangs until its TimeoutStopSec turns into SIGKILL. Without
+ * it the read returns NULL/EINTR, which every serve loop already treats as
+ * "the gateway is gone" -- the path they take on a clean shutdown. colibri.c
+ * carries the same reasoning for its own handler (#810).
+ *
+ * SIGINT is left alone. On these engines it is still the default, immediate
+ * death: making Ctrl-C wait for an in-flight turn, which on a disk-streaming
+ * engine is minutes, would read as a hang. colibri.c can afford a soft SIGINT
+ * because it can end the current turn; these cannot, so they keep the
+ * behaviour their users already expect. */
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <signal.h>
+static volatile sig_atomic_t coli_rt_term_flag = 0;
+static void coli_rt_term_handler(int sig) { (void)sig; coli_rt_term_flag = 1; }
+/* Call once, just before entering a serve loop. */
+static inline void coli_rt_term_arm(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = coli_rt_term_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;                       /* see above: SA_RESTART would hang the stop */
+    sigaction(SIGTERM, &sa, NULL);
+}
+#else
+static inline void coli_rt_term_arm(void) {}   /* Windows: no sigaction, behaviour unchanged */
+#endif
 
 #endif /* ROUTE_TRACE_H */

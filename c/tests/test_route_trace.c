@@ -9,9 +9,23 @@
  * easy to break by "tidying" the header into a comment line or moving the engine hash
  * into the second field, so it is asserted here against a literal copy of that loop.
  *
- * This test includes route_trace.h and nothing else: no Model, no Cfg, no st.h. That is
- * the point of the header — any engine can use it — and compiling this file proves it. */
+ * This test includes route_trace.h (plus compat.h) and nothing else: no Model, no Cfg, no st.h.
+ * That is the point of the header — any engine can use it — and compiling this file proves it. */
+#include <stdio.h>
+#include <errno.h>
+
+/* Simulate a delayed buffered-write failure reported when closing a stream. */
+static int fail_history_close;
+static int history_test_fclose(FILE *f){
+    int rc = fclose(f);
+    if(fail_history_close){ errno = ENOSPC; return EOF; }
+    return rc;
+}
+#define fclose history_test_fclose
 #include "../route_trace.h"
+#undef fclose
+
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
 
 static int g_nfails = 0;
 static void check(int cond, const char *what){
@@ -124,6 +138,12 @@ int main(void){
         check(rt_engine_of(rt_hash("kimi_k3")) != NULL, "the writer can be named");
         check(strcmp(rt_engine_of(rt_hash("kimi_k3")), "kimi_k3") == 0, "named correctly");
         check(rt_engine_of(12345u) == NULL, "an unknown id has no name");
+        /* deepseek_v4 writes through this same header (its private writer is gone,
+         * #700 completed), so its id must resolve to a name like every sibling's */
+        check(strcmp(rt_engine_of(rt_hash("deepseek_v4")), "deepseek_v4") == 0,
+              "the deepseek_v4 writer can be named");
+        check(strcmp(rt_engine_of(rt_hash("qwen38")), "qwen38") == 0,
+              "the qwen38 writer can be named");
     }
 
     /* 7. inkling's IKU1 layout is refused by any engine that is not inkling */
@@ -297,9 +317,41 @@ int main(void){
         }
     }
 
+    /* 8. USAGE_SAVE=0 is a read-only run (#1039): rt_save reports success but the
+     * file must not be touched — a benchmark loop relies on the profile it measures
+     * staying frozen. Enforced in rt_save itself so every engine gets it. */
+    {
+        rt_counts(3)[4] = 99;
+        setenv("USAGE_SAVE", "0", 1);
+        long before = fsize(TMP);
+        check(rt_save(TMP, 1) == 1, "USAGE_SAVE=0: a requested skip is not a failure");
+        check(fsize(TMP) == before, "USAGE_SAVE=0: the history file is not rewritten");
+        setenv("USAGE_SAVE", "1", 1);
+        check(rt_save(TMP, 1) == 1, "USAGE_SAVE=1: saving works again");
+        check(fsize(TMP) != before, "USAGE_SAVE=1: the new counter reaches the file");
+        unsetenv("USAGE_SAVE");
+    }
+
+    /* A failed close must not publish a partial temp file over good history. */
+    {
+        FILE *f = fopen(TMP, "w");
+        fprintf(f, "previous history\n");
+        fclose(f);
+        fail_history_close = 1;
+        check(rt_save(TMP, 1) == 0, "a delayed write failure is reported");
+        fail_history_close = 0;
+        char buf[64] = {0};
+        f = fopen(TMP, "r");
+        if(f){ (void)fread(buf, 1, sizeof(buf)-1, f); fclose(f); }
+        check(strcmp(buf, "previous history\n") == 0,
+              "failed save preserves the previous history");
+        check(rt_save(TMP, 1) == 1, "save recovers after a delayed write failure");
+    }
+
     remove(TMP);
     if(g_nfails){ printf("route_trace: %d FAILED\n", g_nfails); return 1; }
     printf("route_trace: empty-history size, round trip, legacy read, refusals, "
-           "admitted-only totals, trusted read, dropped rows, old-reader contract ok\n");
+           "admitted-only totals, trusted read, dropped rows, old-reader contract, "
+           "USAGE_SAVE=0 read-only ok\n");
     return 0;
 }

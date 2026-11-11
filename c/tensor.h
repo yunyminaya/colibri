@@ -18,7 +18,9 @@ typedef enum {
     COLI_TENSOR_FP8_E4M3_BLOCK,
     COLI_TENSOR_FP4_NATIVE_BLOCK,
     COLI_TENSOR_INT8_BLOCK,
-    COLI_TENSOR_INT4_BLOCK
+    COLI_TENSOR_INT4_BLOCK,
+    COLI_TENSOR_GGML      /* a GGUF tensor's blocks as the file has them; block_columns
+                           * holds their ggml type (ggml_quants.h GQ_*) */
 } ColiTensorFormat;
 
 typedef enum {
@@ -38,6 +40,10 @@ typedef struct {
     int64_t columns;
     uint32_t block_rows;
     uint32_t block_columns;
+    /* Optional backend-resident mirror of this weight (e.g. a Dsv4CudaTensor*).
+     * NULL on the CPU-only paths; owned and freed by the backend tier, never by
+     * the view. */
+    void *gpu;
 } ColiTensorView;
 
 #ifdef __cplusplus

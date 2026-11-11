@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include "json.h"
 #include "compat.h"
+#include "load_fail.h"
 
 /* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
@@ -33,7 +34,7 @@ typedef struct {
     int     fd;
     int64_t off;       /* offset assoluto del dato dentro al file */
     int64_t nbytes;
-    int     dtype;     /* 0=BF16 1=F16 2=F32 3=U8/I8 4=F8_E4M3 5=F8_E8M0 6=I64 */
+    int     dtype;     /* 0=BF16 1=F16 2=F32 3=U8/I8 4=F8_E4M3 5=F8_E8M0 6=I64 7=U32/I32 */
     int64_t numel;
     int     rank;
     int64_t shape[ST_MAX_RANK];
@@ -95,7 +96,13 @@ static int st_dtype_code(const char *s) {
         !strcmp(s, "float8_e4m3fn")) return 4;
     if (!strcmp(s, "F8_E8M0") || !strcmp(s, "F8_E8M0FNU")) return 5;
     if (!strcmp(s, "I64") || !strcmp(s, "U64")) return 6;
-    fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
+    /* I32/U32: token ids in reference dumps (tools/make_qwenimage_tiny.py), and
+     * the packed U32 words of MLX affine-quantized checkpoints (Swiftlet qpack
+     * containers included; qwen36's dense affine loader reads them through
+     * st_read_raw after validating the packed geometry). Same rule as the fp8
+     * codes above: a new number, read raw, refused by the float readers. */
+    if (!strcmp(s, "I32") || !strcmp(s, "U32")) return 7;
+    coli_load_fail(COLI_LOAD_FAIL_UNSUPPORTED, "unsupported dtype: %s", s);
 }
 
 /* Byte per elemento. UNICO posto che lo sa: prima la formula era ripetuta in tre
@@ -106,6 +113,7 @@ static inline int st_dtype_esz(int dtype) {
         case 2: return 4;                 /* F32 */
         case 3: case 4: case 5: return 1; /* U8/I8, F8_E4M3, F8_E8M0 */
         case 6: return 8;                 /* I64/U64 */
+        case 7: return 4;                 /* I32/U32 */
         default: return 2;                /* BF16, F16 */
     }
 }
@@ -115,7 +123,7 @@ static inline const char *st_dtype_name(int dtype) {
     switch (dtype) {
         case 0: return "BF16"; case 1: return "F16"; case 2: return "F32";
         case 3: return "U8/I8"; case 4: return "F8_E4M3"; case 5: return "F8_E8M0";
-        case 6: return "I64"; default: return "?";
+        case 6: return "I64"; case 7: return "I32"; default: return "?";
     }
 }
 
@@ -138,14 +146,183 @@ static inline float f16_to_f32(uint16_t h) {
     float f; memcpy(&f, &u, 4); return f;
 }
 
+/* ---- bulk BF16/F16 -> F32, AVX2/SSE4.1/scalar tiers --------------------
+ * st_read_f32/st_read_slice_f32 convert whole tensors (up to the embed/
+ * lm_head matrix, vocab*hidden elements) through bf16_to_f32/f16_to_f32 one
+ * halfword at a time; that loop is pure overhead once the read syscall is
+ * off the critical path. The tiers below batch it, same idea and layering
+ * as gsgemv.h's AVX2/SSE4.1 kernels (immintrin.h only under the ISA guard,
+ * sse41_kernels.h not needed here -- no FMA, no shared load helper to reuse).
+ *
+ * BF16 -> F32 is an exact zero-pad widening for every bit pattern (BF16
+ * shares F32's 8-bit exponent field, so there is no special-casing --
+ * zero, normal, subnormal, inf, NaN all take the same `<<16`), so the
+ * vectorized tiers cannot disagree with the scalar reference.
+ *
+ * F16 -> F32's zero/normal/inf-NaN classes are each the same closed-form
+ * bit algebra as the scalar reference above, just run on several lanes at
+ * once -- no reassociation, nothing to round, so still bit-exact. True
+ * subnormals (exp==0, man!=0) need the scalar reference's shift-to-normalize
+ * loop, which does not vectorize; those (rare in real model weights) fall
+ * back to f16_to_f32 per element. Exhaustive verification (all 65536
+ * patterns per format) lives in tests/test_st_f16_bf16_simd.c. */
+#if defined(__AVX2__) || defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
+
+#if defined(__AVX2__)
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i h = _mm_loadu_si128((const __m128i*)(src + i));
+        __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    const __m256i vsign_mask = _mm256_set1_epi32(0x8000);
+    const __m256i vexp_mask  = _mm256_set1_epi32(0x1F);
+    const __m256i vman_mask  = _mm256_set1_epi32(0x3FF);
+    const __m256i v112       = _mm256_set1_epi32(112);
+    const __m256i vinfnan_e  = _mm256_set1_epi32(0x7F800000);
+    const __m256i vzero      = _mm256_setzero_si256();
+    const __m256i v31        = _mm256_set1_epi32(31);
+    for (; i + 8 <= n; i += 8) {
+        __m128i h16 = _mm_loadu_si128((const __m128i*)(src + i));
+        __m256i h    = _mm256_cvtepu16_epi32(h16);
+        __m256i sign = _mm256_slli_epi32(_mm256_and_si256(h, vsign_mask), 16);
+        __m256i exp  = _mm256_and_si256(_mm256_srli_epi32(h, 10), vexp_mask);
+        __m256i man  = _mm256_and_si256(h, vman_mask);
+        __m256i normal_u = _mm256_or_si256(sign, _mm256_or_si256(
+            _mm256_slli_epi32(_mm256_add_epi32(exp, v112), 23), _mm256_slli_epi32(man, 13)));
+        __m256i infnan_u = _mm256_or_si256(sign, _mm256_or_si256(vinfnan_e, _mm256_slli_epi32(man, 13)));
+        __m256i exp_is_zero = _mm256_cmpeq_epi32(exp, vzero);
+        __m256i man_is_zero = _mm256_cmpeq_epi32(man, vzero);
+        __m256i is_zero    = _mm256_and_si256(exp_is_zero, man_is_zero);
+        __m256i is_subnorm = _mm256_andnot_si256(man_is_zero, exp_is_zero);
+        __m256i is_infnan  = _mm256_cmpeq_epi32(exp, v31);
+        __m256i result = _mm256_blendv_epi8(normal_u, sign, is_zero);
+        result = _mm256_blendv_epi8(result, infnan_u, is_infnan);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(result));
+        int m = _mm256_movemask_ps(_mm256_castsi256_ps(is_subnorm));
+        if (m) for (int k = 0; k < 8; k++) if ((m >> k) & 1) dst[i+k] = f16_to_f32(src[i+k]);
+    }
+    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#elif defined(__SSE4_1__)
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        __m128i h = _mm_loadl_epi64((const __m128i*)(src + i));
+        __m128i w = _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16);
+        _mm_storeu_ps(dst + i, _mm_castsi128_ps(w));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    const __m128i vsign_mask = _mm_set1_epi32(0x8000);
+    const __m128i vexp_mask  = _mm_set1_epi32(0x1F);
+    const __m128i vman_mask  = _mm_set1_epi32(0x3FF);
+    const __m128i v112       = _mm_set1_epi32(112);
+    const __m128i vinfnan_e  = _mm_set1_epi32(0x7F800000);
+    const __m128i vzero      = _mm_setzero_si128();
+    const __m128i v31        = _mm_set1_epi32(31);
+    for (; i + 4 <= n; i += 4) {
+        __m128i h16 = _mm_loadl_epi64((const __m128i*)(src + i));
+        __m128i h    = _mm_cvtepu16_epi32(h16);
+        __m128i sign = _mm_slli_epi32(_mm_and_si128(h, vsign_mask), 16);
+        __m128i exp  = _mm_and_si128(_mm_srli_epi32(h, 10), vexp_mask);
+        __m128i man  = _mm_and_si128(h, vman_mask);
+        __m128i normal_u = _mm_or_si128(sign, _mm_or_si128(
+            _mm_slli_epi32(_mm_add_epi32(exp, v112), 23), _mm_slli_epi32(man, 13)));
+        __m128i infnan_u = _mm_or_si128(sign, _mm_or_si128(vinfnan_e, _mm_slli_epi32(man, 13)));
+        __m128i exp_is_zero = _mm_cmpeq_epi32(exp, vzero);
+        __m128i man_is_zero = _mm_cmpeq_epi32(man, vzero);
+        __m128i is_zero    = _mm_and_si128(exp_is_zero, man_is_zero);
+        __m128i is_subnorm = _mm_andnot_si128(man_is_zero, exp_is_zero);
+        __m128i is_infnan  = _mm_cmpeq_epi32(exp, v31);
+        __m128i result = _mm_blendv_epi8(normal_u, sign, is_zero);
+        result = _mm_blendv_epi8(result, infnan_u, is_infnan);
+        _mm_storeu_ps(dst + i, _mm_castsi128_ps(result));
+        int m = _mm_movemask_ps(_mm_castsi128_ps(is_subnorm));
+        if (m) for (int k = 0; k < 4; k++) if ((m >> k) & 1) dst[i+k] = f16_to_f32(src[i+k]);
+    }
+    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#else
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    for (int64_t i = 0; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    for (int64_t i = 0; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#endif
+
+/* ---- a shard's second descriptor: the reads that run together ----
+ * A shard is opened once and every thread preads that descriptor. On Windows a
+ * descriptor from open() is a synchronous handle, and the I/O manager serves
+ * one read at a time through it, whatever the thread count: the reads of an
+ * OpenMP team on one shard went to the drive in single file. So a shard may
+ * carry a second descriptor, opened for overlapped I/O (compat_open_overlapped;
+ * there is none elsewhere, where a positional pread already overlaps).
+ *
+ * The reader that finds the shard free takes it and reads through the first
+ * descriptor, exactly as before; a reader that finds it taken reads through the
+ * second. A lone reader therefore never leaves the path it always had -- an
+ * overlapped read is completed by another thread and costs a reader that is
+ * alone a wake-up it does not need -- and the readers of a team overlap.
+ *
+ * Indexed by fd, lock-free and static like the mappings further down, and for
+ * the same reason (st.h is also built without -pthread). A pair is set when
+ * its shard is opened and cleared when st.h closes it. */
+#define ST_MAX_PAIRED_FD 4096
+static int g_st_shard_ofd[ST_MAX_PAIRED_FD];             /* second descriptor + 1; 0 = none */
+static signed char g_st_shard_taken[ST_MAX_PAIRED_FD];
+
+/* Gives `fd` the second descriptor `ofd` (-1: none), closing the one it had. */
+static void st_shard_pair(int fd, int ofd) {
+    if (fd < 0 || fd >= ST_MAX_PAIRED_FD) { if (ofd >= 0) close(ofd); return; }
+    int old = __atomic_exchange_n(&g_st_shard_ofd[fd], ofd >= 0 ? ofd + 1 : 0, __ATOMIC_ACQ_REL) - 1;
+    if (old >= 0) close(old);
+}
+/* The descriptor this read goes through: `fd` itself if the shard was free
+ * (and is now taken), its second descriptor otherwise. */
+static int st_shard_enter(int fd) {
+    if (fd < 0 || fd >= ST_MAX_PAIRED_FD) return fd;
+    int ofd = __atomic_load_n(&g_st_shard_ofd[fd], __ATOMIC_ACQUIRE) - 1;
+    if (ofd < 0) return fd;
+    signed char unclaimed = 0;
+    return __atomic_compare_exchange_n(&g_st_shard_taken[fd], &unclaimed, (signed char)1,
+                                       0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ? fd : ofd;
+}
+static void st_shard_leave(int fd, int via) {
+    if (via != fd || fd < 0 || fd >= ST_MAX_PAIRED_FD) return;
+    if (__atomic_load_n(&g_st_shard_ofd[fd], __ATOMIC_ACQUIRE))
+        __atomic_store_n(&g_st_shard_taken[fd], (signed char)0, __ATOMIC_RELEASE);
+}
+/* One pread of a shard, through whichever of its descriptors is this read's. */
+static ssize_t st_pread_once(int fd, void *buf, size_t n, int64_t off) {
+    int via = st_shard_enter(fd);
+    ssize_t r = pread(via, buf, n, (off_t)off);
+    int saved = errno;
+    st_shard_leave(fd, via);
+    errno = saved;
+    return r;
+}
+
 static int st_open_fd(shards *S, const char *path) {
     for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
     int fd = open(path, COMPAT_O_RDONLY);
-    if (fd < 0) { perror(path); exit(1); }
+    if (fd < 0) coli_load_fail(coli_load_fail_kind_from_errno(errno), "%s: %s", path, strerror(errno));
     struct stat sb;
-    if (fstat(fd, &sb) != 0) { perror("fstat shard"); close(fd); exit(1); }
+    if (fstat(fd, &sb) != 0) { int saved = errno; close(fd);
+        coli_load_fail(coli_load_fail_kind_from_errno(saved), "fstat shard: %s", strerror(saved)); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
     S->sizes[S->nfd] = (int64_t)sb.st_size;
+    st_shard_pair(fd, compat_open_overlapped(path));
 #ifdef O_DIRECT
     S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
 #elif defined(__APPLE__) || defined(_WIN32)
@@ -181,6 +358,23 @@ static int st_direct_fd_rep(shards *S, int fd, int rep) {
     int i = st_fidx(S, fd); return i < 0 ? -1 : S->mdfds[rep-1][i];
 }
 
+/* A file read without the kernel's readahead, on every drive that holds it (the primary and its
+ * mirrors registered so far). A GGUF keeps a layer's experts in three tensors, so an expert is
+ * three slices read apart through the page cache, and the readahead read past each one: on a
+ * two-NVMe md array with its 2 MiB readahead, Kimi K3 UD-IQ1_S read 17.3 GB a decoded token for
+ * 6.7 GB of experts (0.27 tok/s; 0.34 without it), GLM-5.2 UD-IQ1_S 6.2-6.6 GB for 3.6. A whole
+ * tensor's pread still reads its whole range, so loading the dense matrices does not change. */
+static void st_no_readahead(shards *S, int fd) {
+#if defined(POSIX_FADV_RANDOM) && !defined(_WIN32)
+    for (int r = 0; r <= S->nrep; r++) {
+        int f = st_fd_rep(S, fd, r);
+        if (f >= 0) posix_fadvise(f, 0, 0, POSIX_FADV_RANDOM);
+    }
+#else
+    (void)S; (void)fd;
+#endif
+}
+
 /* Registers <dir>/<basename> as read replica S->nrep+1 of every already-indexed
  * shard. A file is accepted ONLY if its size and safetensors header are
  * byte-identical to the primary: the data_offsets then match by construction,
@@ -191,7 +385,7 @@ static int st_direct_fd_rep(shards *S, int fd, int rep) {
  * .coli_kv keep deriving from the primary alone. */
 static void st_mirror_reset(shards *S) {           /* re-init: drop every replica */
     for (int r = 0; r < S->nrep; r++) for (int i = 0; i < S->nfd; i++) {
-        if (S->mfds[r][i] >= 0) close(S->mfds[r][i]);
+        if (S->mfds[r][i] >= 0) { st_shard_pair(S->mfds[r][i], -1); close(S->mfds[r][i]); }
         if (S->mdfds[r][i] >= 0) close(S->mdfds[r][i]);
     }
     memset(S->nmirror, 0, sizeof(S->nmirror));
@@ -231,6 +425,7 @@ static int st_mirror_add(shards *S, const char *dir) {
             close(mfd); continue;
         }
         S->mfds[r][i] = mfd;
+        st_shard_pair(mfd, compat_open_overlapped(mp));
 #ifdef O_DIRECT
         S->mdfds[r][i] = open(mp, COMPAT_O_RDONLY | O_DIRECT);
 #elif defined(__APPLE__) || defined(_WIN32)
@@ -264,17 +459,18 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
     while (got < n) {
         int64_t want = n - got;
         if (want > (int64_t)ST_PREAD_CHUNK) want = ST_PREAD_CHUNK;
-        ssize_t r = pread(fd, p + got, (size_t)want, off + got);
+        ssize_t r = st_pread_once(fd, p + got, (size_t)want, off + got);
         if (r < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "%s: %s (off %lld, %lld/%lld bytes)\n", tag, strerror(errno),
-                    (long long)off, (long long)got, (long long)n);
-            exit(1);
+            int saved = errno;
+            coli_load_fail(coli_load_fail_kind_from_errno(saved),
+                           "%s: %s (off %lld, %lld/%lld bytes)", tag, strerror(saved),
+                           (long long)off, (long long)got, (long long)n);
         }
         if (r == 0) {
-            fprintf(stderr, "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?\n",
-                    tag, (long long)off, (long long)got, (long long)n);
-            exit(1);
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT,
+                           "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?",
+                           tag, (long long)off, (long long)got, (long long)n);
         }
         got += r;
     }
@@ -332,7 +528,7 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] is not a JSON string -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
     char *arena2 = NULL;
-    jval *inner = json_parse(stamp->str, &arena2);
+    jval *inner = json_parse_checked(stamp->str);
     if (!inner || inner->t != J_OBJ) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] does not parse as a JSON object -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
@@ -377,16 +573,32 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
                     shard_path, ST_FMT_STAMP_MAX); exit(1); }
         if (S->fmt_n == S->fmt_cap) {
             S->fmt_cap = S->fmt_cap ? S->fmt_cap * 2 : 16;
-            S->fmt_name = realloc(S->fmt_name, S->fmt_cap * sizeof(char*));
-            S->fmt_val  = realloc(S->fmt_val,  S->fmt_cap * sizeof(char*));
+            char **nn = (char**)realloc(S->fmt_name, S->fmt_cap * sizeof(char*));
+            if (!nn) { fprintf(stderr, "%s: OOM reallocating format-stamp table (fmt_name, %d entries)\n",
+                        shard_path, S->fmt_cap); exit(1); }
+            S->fmt_name = nn;
+            char **nv = (char**)realloc(S->fmt_val, S->fmt_cap * sizeof(char*));
+            if (!nv) { fprintf(stderr, "%s: OOM reallocating format-stamp table (fmt_val, %d entries)\n",
+                        shard_path, S->fmt_cap); exit(1); }
+            S->fmt_val = nv;
         }
-        S->fmt_name[S->fmt_n] = strdup(inner->keys[i]);
-        S->fmt_val[S->fmt_n]  = strdup(v->str);
+        /* Neither strdup here is benign to drop: a NULL fmt_name would be dereferenced by
+         * the duplicate-scan strcmp above on the very next entry, and a NULL fmt_val is
+         * worse -- the process would exit 0 with no diagnostic, st_fmt_stamp() would then
+         * return NULL for a tensor that IS stamped, and the container would silently read
+         * as unstamped: qt_verify_fmt_stamp's TRUST-VERIFY-REFUSE check (colibri.c) is a
+         * no-op on an unstamped tensor, so one failed allocation would quietly disable it
+         * on an untrusted-container path. Refuse instead. */
+        char *sn = strdup(inner->keys[i]), *sv = strdup(v->str);
+        if (!sn || !sv) { fprintf(stderr, "%s: OOM duplicating __metadata__[\"colibri.fmt\"] stamp "
+                    "for tensor '%s' -- refusing (a dropped stamp would silently disable format "
+                    "verification for this tensor)\n", shard_path, inner->keys[i]); exit(1); }
+        S->fmt_name[S->fmt_n] = sn;
+        S->fmt_val[S->fmt_n]  = sv;
         S->fmt_n++;
     }
-    free(arena2);  /* always NULL (json_parse never populates it -- see j_dup); the jval
-                    * tree itself is intentionally leaked, same one-time-startup convention
-                    * as st_init_multi's own root parse a few lines below. */
+    json_free(inner);
+    free(arena2);  /* always NULL (json_parse never populates it -- see j_dup). */
 }
 
 /* Stamped format NAME for `name`, or NULL if this tensor carries no stamp
@@ -411,13 +623,78 @@ static const char *st_fmt_stamp(shards *S, const char *name) {
     return NULL;
 }
 
+/* model.safetensors.index.json, consulted only when two indexed shards carry the
+ * same tensor name. Checkpoints distributed with an "overlay" shard (a community
+ * abliteration, say) keep the superseded tensors physically in the base shards
+ * and let the index say which copy is authoritative; HF transformers honours
+ * the index, and refusing the directory outright (#1479) made such checkpoints
+ * unloadable without rewriting their shards. Loaded lazily: a clean container
+ * never pays the parse (the Qwen3.8 index alone is 17 MB), and a container
+ * without an index keeps the old refusal, because then nothing says which
+ * bytes a name should resolve to. */
+typedef struct { jval *root, *map; char *arena; int *h; int hcap; int tried; } st_index;
+
+static const char *st_basename(const char *p) {
+    const char *b = strrchr(p, '/');
+#ifdef _WIN32
+    const char *b2 = strrchr(p, '\\');
+    if (b2 && (!b || b2 > b)) b = b2;
+#endif
+    return b ? b + 1 : p;
+}
+static void st_index_load(st_index *ix, const char *dir) {
+    if (ix->tried) return;
+    ix->tried = 1;
+    char path[1200];
+    int written = snprintf(path, sizeof(path), "%s/model.safetensors.index.json", dir);
+    if (written < 0 || (size_t)written >= sizeof(path)) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
+    if (size <= 0 || size > (256l << 20)) { fclose(f); return; }
+    char *text = malloc((size_t)size + 1);
+    if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) { free(text); fclose(f); return; }
+    text[size] = 0; fclose(f);
+    ix->root = memchr(text, 0, (size_t)size) ? NULL : json_parse_checked(text);
+    free(text);
+    jval *map = ix->root ? json_get(ix->root, "weight_map") : NULL;
+    if (!map || map->t != J_OBJ) { json_free(ix->root); ix->root = NULL; free(ix->arena); ix->arena = NULL; return; }
+    ix->map = map;
+    ix->hcap = 1; while (ix->hcap < map->len * 2) ix->hcap <<= 1;
+    ix->h = malloc((size_t)ix->hcap * sizeof(int));
+    if (!ix->h) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "OOM indexing model.safetensors.index.json");
+    for (int i = 0; i < ix->hcap; i++) ix->h[i] = -1;
+    for (int i = 0; i < map->len; i++) {
+        uint64_t hh = st_hash(map->keys[i]) & (ix->hcap - 1);
+        while (ix->h[hh] >= 0) hh = (hh + 1) & (ix->hcap - 1);
+        ix->h[hh] = i;
+    }
+}
+/* the shard basename the index declares for `name`, or NULL (no index, or name absent) */
+static const char *st_index_shard(st_index *ix, const char *name) {
+    if (!ix->map) return NULL;
+    uint64_t hh = st_hash(name) & (ix->hcap - 1);
+    while (ix->h[hh] >= 0) {
+        int i = ix->h[hh];
+        if (!strcmp(ix->map->keys[i], name))
+            return ix->map->kids[i]->t == J_STR ? ix->map->kids[i]->str : NULL;
+        hh = (hh + 1) & (ix->hcap - 1);
+    }
+    return NULL;
+}
+static void st_index_free(st_index *ix) {
+    json_free(ix->root); free(ix->arena); free(ix->h);
+    memset(ix, 0, sizeof(*ix));
+}
+
 /* Scan one directory for *.safetensors shards, appending to files[] (dedup by
+
  * basename, so a list of directories acts as a SEARCH PATH: the same shard
  * present on two drives is taken from the first-listed one only). *added
  * returns how many shards this dir contributed. */
 static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added) {
     DIR *d = opendir(dir); struct dirent *e;
-    if (!d) { perror(dir); exit(1); }
+    if (!d) coli_load_fail(coli_load_fail_kind_from_errno(errno), "%s: %s", dir, strerror(errno));
     int base_n = *nf;
     while ((e = readdir(d))) {
         const char *dot = strrchr(e->d_name, '.');
@@ -446,9 +723,37 @@ static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added
  * drive holds that shard, so concurrent expert loads parallelise across drives
  * and combined capacity is used. Scales to N drives. Metadata (config /
  * tokenizer / .coli_usage / .coli_kv) is read from snap_dir only. */
+#ifdef ST_GGUF
+static int st_init_gguf(shards *S, const char *snap_dir);   /* st_gguf.h: a gguf_import folder */
+#endif
 static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dirs) {
     memset(S, 0, sizeof(*S));
+#ifdef ST_GGUF
+    if (st_init_gguf(S, snap_dir)) return;
+#endif
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
+    /* Duplicate-tensor-name detector, indexed-shard scope.
+     * st_find()/S->hidx (below) aren't built until every shard has been read, so a
+     * duplicate name across two shards would otherwise go unnoticed until AFTER both are
+     * already appended to S->t -- by then the collision has already happened silently:
+     * st_find() would return whichever shard was appended first, while a container-wide
+     * __metadata__["colibri.fmt"] stamp for that name (st_fmt_stamp_ingest above) would
+     * still apply uniformly. A directory blending two containers under the same tensor
+     * names (e.g. an FP8 copy and an int8 copy of the same o_proj) would then silently read
+     * one shard's bytes labeled with a format that describes the other's -- no error, no
+     * warning, plausible numbers. This is a DIFFERENT concern from st_fmt_stamp_ingest's
+     * own duplicate check a few lines above: that dedups format CLAIMS keyed by name (and
+     * already refuses on a disagreeing claim); this dedups the tensor DATA entries
+     * themselves, the actual byte ranges a read resolves to. Kept as its own temporary
+     * open-addressing table (same probe scheme st_hash()/S->hidx use below) rather than a
+     * linear rescan, because a real container indexes on the order of 1e5 tensors and an
+     * O(n^2) scan at that scale is not a rounding error. Grown in lockstep with S->cap
+     * (below) and freed at the end of this function, just before S->hidx is built. */
+    int dup_cap = 1; while (dup_cap < S->cap * 2) dup_cap <<= 1;
+    int *dup_idx = (int*)malloc(dup_cap * sizeof(int));
+    if (!dup_idx) { fprintf(stderr, "OOM allocating duplicate-tensor-name detector (%d entries)\n",
+                dup_cap); exit(1); }
+    for (int di = 0; di < dup_cap; di++) dup_idx[di] = -1;
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
     int c0 = 0; st_scan_dir(snap_dir, files, &nf, &c0);
@@ -474,6 +779,8 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
         if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; memcpy(tmp, files[a], 1024); memcpy(files[a], files[b], 1024); memcpy(files[b], tmp, 1024); }
 
+    st_index ix; memset(&ix, 0, sizeof(ix));
+    int n_overlay = 0;
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
         int fidx = st_fidx(S, fd);
@@ -486,17 +793,19 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
          * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
          * malloc gigante. */
         if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
-            fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
-                    files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: bad safetensors header length %llu (file %lld bytes)",
+                           files[fi], (unsigned long long)hlen, (long long)fsz); }
         char *hdr = malloc(hlen + 1);
-        if (!hdr) { perror("malloc safetensors header"); exit(1); }
+        if (!hdr) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc safetensors header: %s", strerror(errno));
         st_pread_full(fd, hdr, (int64_t)hlen, 8, "pread hdr");
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
-        jval *root = json_parse(hdr, &arena);
+        /* A partial object must not index weights or authorize an overlay.
+         * Header padding is JSON whitespace; embedded NUL is not padding. */
+        jval *root = memchr(hdr, 0, (size_t)hlen) ? NULL : json_parse_checked(hdr);
         if (!root || root->t != J_OBJ) {
-            fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: safetensors header is not a JSON object", files[fi]); }
         st_fmt_stamp_ingest(S, root, files[fi]);
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
@@ -512,12 +821,20 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                 !shp || shp->t != J_ARR || shp->len > ST_MAX_RANK) {
                 fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
                         files[fi], name); exit(1); }
-            int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
+            jval *off_a = off->kids[0], *off_b = off->kids[1];
+            if (!off_a || !off_b || off_a->t != J_NUM || off_b->t != J_NUM ||
+                !isfinite(off_a->num) || !isfinite(off_b->num) ||
+                off_a->num < 0.0 || off_b->num < 0.0 ||
+                off_a->num >= ldexp(1.0, 63) || off_b->num >= ldexp(1.0, 63) ||
+                floor(off_a->num) != off_a->num || floor(off_b->num) != off_b->num) {
+                fprintf(stderr, "%s: tensor '%s' has invalid data_offsets\n",
+                        files[fi], name); exit(1); }
+            int64_t a0 = (int64_t)off_a->num, b0 = (int64_t)off_b->num;
             /* offset dichiarati dal file: non-negativi, ordinati e dentro al
              * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
              * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
              * oppure off punta fuori dal file. */
-            if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
+            if (b0 < a0 || b0 > INT64_MAX - data_start || data_start + b0 > fsz) {
                 fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
                         files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
             /* SEC: lo shape viene da un file non fidato (mirror). Senza il guard
@@ -537,17 +854,79 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             if (bad_shape) {
                 fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
                         files[fi], name); exit(1); }
+            /* `name` already indexed from an earlier shard? The checkpoint's own index
+             * decides: the copy the index maps the name to is read, the other one is
+             * ignored (an overlay shard superseding base-shard tensors, #1479). No index,
+             * or an index that names neither shard, keeps the refusal: a directory
+             * holding both would silently read one shard's bytes for this name while
+             * any __metadata__["colibri.fmt"] stamp for it still applies uniformly. This
+             * is intentionally NOT the same check as st_fmt_stamp_ingest's -- that one
+             * only ever sees the small subset of names a stamping tool chose to
+             * annotate; this one sees every tensor. */
+            int replace_idx = -1, skip = 0;
+            {
+                uint64_t dh = st_hash(name) & (dup_cap - 1);
+                while (dup_idx[dh] >= 0) {
+                    if (!strcmp(S->t[dup_idx[dh]].name, name)) {
+                        int prev = dup_idx[dh];
+                        int prev_fidx = st_fidx(S, S->t[prev].fd);
+                        const char *prev_path = prev_fidx >= 0 ? S->paths[prev_fidx] : "<unknown>";
+                        st_index_load(&ix, snap_dir);
+                        const char *auth = st_index_shard(&ix, name);
+                        if (auth && !strcmp(auth, st_basename(files[fi]))) { replace_idx = prev; n_overlay++; }
+                        else if (auth && !strcmp(auth, st_basename(prev_path))) { skip = 1; n_overlay++; }
+                        else {
+                            fprintf(stderr, "%s: tensor '%s' is also indexed from shard '%s' -- duplicate "
+                                    "tensor name across indexed shards, refusing (a directory holding both "
+                                    "would silently read one shard's bytes for this name while any "
+                                    "__metadata__[\"colibri.fmt\"] stamp for it still applies uniformly).\n"
+                                    "  %s\n",
+                                    files[fi], name, prev_path,
+                                    ix.map ? (auth ? "model.safetensors.index.json maps it to a third shard; the index and the files disagree"
+                                                   : "model.safetensors.index.json does not list this tensor, so it cannot say which copy is authoritative")
+                                           : "no model.safetensors.index.json here to say which copy is authoritative; the checkpoint's index would resolve this");
+                            exit(1);
+                        }
+                        break;
+                    }
+                    dh = (dh + 1) & (dup_cap - 1);
+                }
+            }
+            if (skip) continue;
             if (S->n == S->cap) {
                 S->cap *= 2;
                 st_tensor *nt = (st_tensor*)realloc(S->t, S->cap * sizeof(st_tensor));
                 if (!nt) { fprintf(stderr, "OOM reallocating shard tensor array\n"); exit(1); }
                 S->t = nt;
+                /* keep the duplicate-name detector's load factor low as S->t grows;
+                 * rehash into a table twice the new capacity. */
+                int new_dup_cap = dup_cap * 2;
+                int *ndup = (int*)malloc(new_dup_cap * sizeof(int));
+                if (!ndup) { fprintf(stderr, "OOM growing duplicate-tensor-name detector (%d entries)\n",
+                            new_dup_cap); exit(1); }
+                for (int di = 0; di < new_dup_cap; di++) ndup[di] = -1;
+                for (int di = 0; di < dup_cap; di++) {
+                    if (dup_idx[di] < 0) continue;
+                    uint64_t h = st_hash(S->t[dup_idx[di]].name) & (new_dup_cap - 1);
+                    while (ndup[h] >= 0) h = (h + 1) & (new_dup_cap - 1);
+                    ndup[h] = dup_idx[di];
+                }
+                free(dup_idx); dup_idx = ndup; dup_cap = new_dup_cap;
             }
-            st_tensor *t = &S->t[S->n++];
+            st_tensor *t;
+            if (replace_idx >= 0) { t = &S->t[replace_idx]; free(t->name); }   /* overlay wins: same slot, new bytes */
+            else t = &S->t[S->n++];
             memset(t, 0, sizeof(*t));
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
             t->rank = shp->len;
+            /* Register this name in the duplicate detector now that t->name is
+             * stable, so the next shard's scan (above) sees it. A replaced entry
+             * is already registered at the same index. */
+            if (replace_idx < 0) {
+              uint64_t dh = st_hash(t->name) & (dup_cap - 1);
+              while (dup_idx[dh] >= 0) dh = (dh + 1) & (dup_cap - 1);
+              dup_idx[dh] = S->n - 1; }
             for (int k = 0; k < t->rank; k++) t->shape[k] = (int64_t)shp->kids[k]->num;
             /* cross-check the declared element count against the byte span for FLOAT
              * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
@@ -555,13 +934,20 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
              * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
              * their numel is unused by the read path and legitimately may differ. */
             { int esz = st_dtype_esz(t->dtype);
-              if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
+              if (t->dtype != 3 &&
+                  (numel > INT64_MAX / esz || t->nbytes != numel * (int64_t)esz)) {
                   fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
                           files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
         }
-        free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
+        json_free(root);
+        free(arena);
         free(hdr);
     }
+    if (n_overlay)
+        fprintf(stderr, "[st] %d tensor name(s) present in two shards, resolved by model.safetensors.index.json "
+                        "(the copy the index maps each name to is read, the other ignored)\n", n_overlay);
+    st_index_free(&ix);
+    free(dup_idx);  /* duplicate detector: one-time-startup scratch, superseded by S->hidx below */
     /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
     S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
     S->hidx = malloc(S->hcap * sizeof(int));
@@ -575,6 +961,31 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
 
 /* backward-compatible single-directory entry point */
 static void st_init(shards *S, const char *snap_dir) { st_init_multi(S, snap_dir, NULL); }
+
+/* Long-lived embedding consumers (the Segment runtime is the first one) can
+ * open and close several model ranges in one process.  The historical CLI
+ * exits after one model and intentionally relied on process teardown; expose a
+ * real cleanup path without changing that CLI lifecycle. */
+static void st_destroy(shards *S) {
+    if (!S) return;
+    st_mirror_reset(S);
+    for (int index = 0; index < S->nfd; index++) {
+        if (S->fds[index] >= 0) { st_shard_pair(S->fds[index], -1); close(S->fds[index]); }
+        if (S->dfds[index] >= 0 && S->dfds[index] != S->fds[index])
+            close(S->dfds[index]);
+        free(S->paths[index]);
+    }
+    for (int index = 0; index < S->n; index++) free(S->t[index].name);
+    for (int index = 0; index < S->fmt_n; index++) {
+        free(S->fmt_name[index]);
+        free(S->fmt_val[index]);
+    }
+    free(S->fmt_name);
+    free(S->fmt_val);
+    free(S->hidx);
+    free(S->t);
+    memset(S, 0, sizeof(*S));
+}
 
 static st_tensor *st_find(shards *S, const char *name) {
     if (S->hidx) {
@@ -630,6 +1041,52 @@ static void st_die_missing(shards *S, const char *name) {
     else if (numbered > 0)
         fprintf(stderr, "  shards numbered %05d..%05d, %d file(s)%s\n", lo, hi, numbered,
                 numbered == hi - lo + 1 ? " (contiguous: a gap would be at the tail)" : " (GAPS in the numbering)");
+    /* The checkpoint's own index says more than a file count can: which shard
+     * should hold this name, whether that shard is here, and whether the name
+     * exists in this checkpoint at all. The last case is the one a file count
+     * gets exactly wrong: every shard present, and the tensor never existed,
+     * because the engine running here is not this checkpoint's engine (a
+     * directory copied without config.json, and the GLM default looking for
+     * model.embed_tokens.weight in a Qwen3.8 that stores it under
+     * model.language_model). */
+    {
+        char dir[1200]; snprintf(dir, sizeof dir, "%s", S->paths[0]);
+        char *slash = strrchr(dir, '/');
+#ifdef _WIN32
+        char *bs = strrchr(dir, '\\'); if (bs && (!slash || bs > slash)) slash = bs;
+#endif
+        if (slash) *slash = 0; else snprintf(dir, sizeof dir, ".");
+        st_index ix; memset(&ix, 0, sizeof ix);
+        st_index_load(&ix, dir);
+        if (ix.map) {
+            const char *auth = st_index_shard(&ix, name);
+            if (!auth) {
+                fprintf(stderr,
+                    "\n  model.safetensors.index.json does not list '%s': this checkpoint never had a\n"
+                    "  tensor by that name. The engine running here expects one, so it is not this\n"
+                    "  checkpoint's engine. coli picks the engine from config.json -- run\n"
+                    "  `coli info --model <dir>` and check the family it names; without a config.json\n"
+                    "  there is no family, and the files to copy next to the shards are config.json,\n"
+                    "  tokenizer.json and model.safetensors.index.json from the model repo.\n", name);
+            } else {
+                int present = 0;
+                for (int i = 0; i < S->nfd && !present; i++) present = !strcmp(st_basename(S->paths[i]), auth);
+                if (!present)
+                    fprintf(stderr,
+                        "\n  model.safetensors.index.json maps '%s' to %s, which is not in this\n"
+                        "  directory: that shard is MISSING. Fetch just that file:\n"
+                        "      hf download <repo> %s --local-dir <model-dir>\n", name, auth, auth);
+                else
+                    fprintf(stderr,
+                        "\n  model.safetensors.index.json maps '%s' to %s, which is here but whose\n"
+                        "  header does not declare it: the file is not the one the index describes (an\n"
+                        "  interrupted transfer that kept the name, or a shard from another revision of\n"
+                        "  the repo). Re-download that one shard and compare its size with the repo's.\n", name, auth);
+            }
+            st_index_free(&ix);
+            exit(1);
+        }
+    }
     /* Follow the evidence: telling someone who already has every declared shard to
      * re-download sends them round a loop that cannot help them. */
     if (complete) {
@@ -679,7 +1136,7 @@ static void st_prefetch_rep(shards *S, const char *name, int rep) {
  * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     /* SEC: numel viene dallo shape, nbytes dagli offset — due campi indipendenti
      * del file. Se non concordano, la memcpy F32 (nbytes) o i loop BF16/F16
      * (numel elementi da un raw di soli nbytes) sforano il buffer del chiamante,
@@ -698,14 +1155,14 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
         fprintf(stderr, "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or corrupt file)\n",
                 name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
     void *raw = malloc(t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
+    if (!raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for tensor %s failed", (long long)t->nbytes, name);
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
+        bf16_to_f32_bulk((uint16_t *)raw, out, t->numel);
     } else {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
+        f16_to_f32_bulk((uint16_t *)raw, out, t->numel);
     }
     free(raw);
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
@@ -719,7 +1176,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
  * self-consistent and may keep using st_read_f32. */
 static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->numel < 0 || t->numel > cap) {
         fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
                 name, (long long)t->numel, (long long)cap); exit(1); }
@@ -770,7 +1227,7 @@ static inline float ue8m0_to_f32(uint8_t v) {
  * che il chiamante ha allocato, come in st_read_f32_cap. */
 static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->numel < 0 || t->numel > cap) {
         fprintf(stderr, "scale %s: numel %lld exceeds destination capacity %lld\n",
                 name, (long long)t->numel, (long long)cap); exit(1); }
@@ -783,7 +1240,7 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
         fprintf(stderr, "scale %s: F8_E8M0 numel %lld disagrees with %lld bytes\n",
                 name, (long long)t->numel, (long long)t->nbytes); exit(1); }
     uint8_t *raw = (uint8_t*)malloc((size_t)t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for scale %s failed\n", (long long)t->nbytes, name); exit(1); }
+    if (!raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for scale %s failed", (long long)t->nbytes, name);
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread ue8m0 scale");
     for (int64_t i = 0; i < t->numel; i++) out[i] = ue8m0_to_f32(raw[i]);
     free(raw);
@@ -807,7 +1264,7 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
  * A new caller with none of those wants st_read_raw_cap below. */
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     st_pread_full(t->fd, out, t->nbytes, t->off, "pread raw");
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
@@ -818,11 +1275,254 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
  * check -- and one that has none cannot silently do the wrong thing. */
 static void st_read_raw_cap(shards *S, const char *name, void *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->nbytes < 0 || t->nbytes > cap) {
         fprintf(stderr, "%s: tensor declares %lld bytes, destination holds %lld — refusing "
                 "(untrusted container)\n", name, (long long)t->nbytes, (long long)cap); exit(1); }
     st_read_raw(S, name, out, drop);
+}
+
+/* Read an exact physical range from one indexed shard.  This is intentionally
+ * separate from tensor slices: callers may use it only after validating a
+ * checkpoint-specific packing invariant (for example, two adjacent tensors).
+ * The shard membership, file bounds and destination capacity remain enforced
+ * here so a malformed header cannot turn that optimization into an unchecked
+ * pread. */
+static void st_read_range_raw_cap(shards *S, int fd, int64_t off,
+                                  int64_t nbytes, void *out, int64_t cap,
+                                  int drop, const char *tag) {
+    int fidx=S?st_fidx(S,fd):-1;
+    if(fidx<0){fprintf(stderr,"physical range uses an unindexed shard fd\n");exit(1);}
+    if(off<0||nbytes<0||cap<0||nbytes>cap||
+       off>S->sizes[fidx]||nbytes>S->sizes[fidx]-off||
+       (uint64_t)nbytes>SIZE_MAX){
+        fprintf(stderr,"physical shard range [%lld,+%lld) exceeds file/destination bounds "
+                       "(file %lld, cap %lld) — refusing (untrusted container)\n",
+                (long long)off,(long long)nbytes,(long long)S->sizes[fidx],
+                (long long)cap);exit(1);
+    }
+    if(nbytes>0&&!out){fprintf(stderr,"physical range has a NULL destination\n");exit(1);}
+    if(nbytes>0)st_pread_full(fd,out,nbytes,off,tag&&*tag?tag:"pread physical range");
+    if(drop&&nbytes>0)posix_fadvise(fd,off,nbytes,POSIX_FADV_DONTNEED);
+}
+
+/* ---- replica-aware range read (multi-SSD streaming) ---------------------
+ * st_read_range_raw_cap serves the range from the primary copy and leaves the
+ * bytes in the page cache on the way through. An engine that streams large
+ * expert tensors wants two more things, and the mirror machinery above already
+ * knows where to find them:
+ *
+ *   - the range served by replica `rep` (0 = primary, 1..nrep = mirrors), so
+ *     independent drives can answer together instead of one behind another;
+ *   - that replica's O_DIRECT twin, because a large transient read that is
+ *     copied into the page cache and out again pays for the same bytes twice,
+ *     and an engine that reads them once does not want them cached at all.
+ *
+ * O_DIRECT constrains buffer address, file offset and length to the logical
+ * block size, and a safetensors range starts wherever the writer put it. The
+ * obvious fix -- bounce the range through an aligned scratch buffer -- adds one
+ * full copy of every expert byte to a workload where the disk is the point, so
+ * this instead expects the caller to reserve `off % ST_DIRECT_ALIGN` bytes of
+ * scratch BEHIND the destination and hand over the payload pointer. The window
+ * starting at the enclosing block boundary is then already aligned: one
+ * O_DIRECT pread carries the block-aligned bulk, one short buffered pread
+ * carries the sub-block tail, and the payload lands exactly where the caller
+ * asked for it with nothing to copy afterwards.
+ *
+ * ST_DIRECT_ALIGN is the slack a caller must add to each such buffer. The
+ * alignment is verified rather than assumed, and a caller that did not reserve
+ * the prefix -- or a platform with no O_DIRECT, or a replica without a twin --
+ * silently gets the buffered path. `direct` is the caller's own switch: 0 forces
+ * that path everywhere, which is what an engine exposes so the choice can be
+ * A/B'd on the hardware in front of it rather than argued about. */
+#define ST_DIRECT_ALIGN 4096
+
+/* One aligned pread, EINTR retried. Returns 0 only on a full transfer: O_DIRECT
+ * wants a block-aligned length, so a short read cannot be finished by simply
+ * asking for the rest -- the caller falls back to the buffered path instead. */
+static int st_pread_aligned_try(int fd, void *buf, int64_t n, int64_t off) {
+    for (;;) {
+        ssize_t r = pread(fd, buf, (size_t)n, (off_t)off);
+        if (r == n) return 0;
+        if (r < 0 && errno == EINTR) continue;
+        return -1;
+    }
+}
+
+static void st_read_range_rep(shards *S, int fd, int rep, int64_t off, int64_t nbytes,
+                              void *out, int64_t cap, int drop, int direct,
+                              const char *tag) {
+    int fidx = S ? st_fidx(S, fd) : -1;
+    if (fidx < 0) { fprintf(stderr, "replica range uses an unindexed shard fd\n"); exit(1); }
+    if (off < 0 || nbytes < 0 || cap < 0 || nbytes > cap ||
+        off > S->sizes[fidx] || nbytes > S->sizes[fidx] - off ||
+        (uint64_t)nbytes > SIZE_MAX) {
+        fprintf(stderr, "replica range [%lld,+%lld) exceeds file/destination bounds "
+                        "(file %lld, cap %lld) — refusing (untrusted container)\n",
+                (long long)off, (long long)nbytes, (long long)S->sizes[fidx], (long long)cap);
+        exit(1);
+    }
+    if (nbytes == 0) return;
+    if (!out) { fprintf(stderr, "replica range has a NULL destination\n"); exit(1); }
+    const char *label = tag && *tag ? tag : "pread replica range";
+    /* A partial mirror leaves this shard on the primary; so does a replica index
+     * that no longer exists. Either way the read is valid, just not split. */
+    int rfd = st_fd_rep(S, fd, rep);
+    if (rfd < 0) { rfd = fd; rep = 0; }
+    int64_t pad = off % ST_DIRECT_ALIGN;
+    uint8_t *window = (uint8_t *)out - pad;      /* the caller's reserved scratch */
+    int dfd = direct ? st_direct_fd_rep(S, fd, rep) : -1;
+    if (dfd >= 0 && ((uintptr_t)window & (uintptr_t)(ST_DIRECT_ALIGN - 1)) == 0 &&
+        pad + nbytes <= (int64_t)ST_PREAD_CHUNK) {
+        int64_t want = pad + nbytes;              /* bytes to fill, window-relative */
+        int64_t left = S->sizes[fidx] - (off - pad);
+        int64_t bulk = want & ~(int64_t)(ST_DIRECT_ALIGN - 1);
+        if (bulk > left) bulk = left & ~(int64_t)(ST_DIRECT_ALIGN - 1);
+        /* A device that refuses O_DIRECT costs the call some speed and never its
+         * correctness: the buffered path below reads exactly the same bytes. */
+        if (bulk > 0 && st_pread_aligned_try(dfd, window, bulk, off - pad) == 0) {
+            int64_t tail = want - bulk;
+            if (tail > 0) st_pread_full(rfd, window + bulk, tail, off - pad + bulk, label);
+            return;
+        }
+    }
+    st_pread_full(rfd, out, nbytes, off, label);
+    if (drop) posix_fadvise(rfd, off, nbytes, POSIX_FADV_DONTNEED);
+}
+
+/* Read-only view of one tensor's exact stored bytes.  Unlike st_read_raw this
+ * performs no allocation or copy; unlike a naked mmap pointer it carries the
+ * aligned OS view/handle required for cleanup.  Callers must still validate
+ * dtype and shape for their own format before consuming `data`. */
+typedef struct {
+    compat_ro_map map;
+    const void *data;
+    int64_t nbytes;
+} st_mapped_raw;
+
+static int st_map_raw(shards *S, const char *name, st_mapped_raw *out) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); return -1; }
+    if (!out || t->nbytes <= 0 || (uint64_t)t->nbytes > SIZE_MAX) {
+        errno = EINVAL; return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (compat_map_readonly(t->fd, t->off, (size_t)t->nbytes,
+                            &out->map, &out->data) != 0) return -1;
+    out->nbytes = t->nbytes;
+    return 0;
+}
+
+static void st_unmap_raw(st_mapped_raw *mapped) {
+    if (!mapped) return;
+    compat_unmap_readonly(&mapped->map);
+    mapped->data = NULL;
+    mapped->nbytes = 0;
+}
+
+/* ---- per-shard mapping cache (opt-in: COLI_MAP_EXPERTS=1) --------------
+ * One mapping per FILE, kept for the process lifetime (shards stay open for
+ * the whole run, so there is nothing shorter-lived to tie the mapping to).
+ * A failed mapping is remembered per fd so it is not retried on every call;
+ * callers must treat a NULL return as "use pread", not as an error. */
+#define ST_MAX_MAPPED_FD 4096
+static uint8_t *g_st_shard_base[ST_MAX_MAPPED_FD];
+static int64_t g_st_shard_len[ST_MAX_MAPPED_FD];
+static signed char g_st_shard_tried[ST_MAX_MAPPED_FD];
+
+static int st_map_experts_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_MAP_EXPERTS"); on = (e && atoi(e)) ? 1 : 0; }
+    return on;
+}
+
+/* Reached from parallel regions: glm53.c's `#pragma omp parallel for` over the
+ * batch calls expert_read -> st_map_shard_range -> here from every worker at
+ * once, and qwen38_core.h does the same. Two threads racing the plain version
+ * of this both saw g_st_shard_tried[fd] == 0, both mapped the file, and one
+ * leaked its mapping while a third could read g_st_shard_len[fd] as 0 through
+ * an already-published base -- st_map_shard_range then rejects every range for
+ * that shard. Latent only because COLI_MAP_EXPERTS is opt-in; #1350 proposes
+ * flipping that default.
+ *
+ * Lock-free rather than the mutex qwen38_core.h uses for its lazy HITS table,
+ * because st.h is also compiled into c/tools/check_glm53_container.c, whose
+ * documented build line is plain `gcc -O2 -std=gnu11 -Ic ... -lm` with neither
+ * -pthread nor -fopenmp. */
+static const uint8_t *st_shard_mapped(int fd) {
+    if (fd < 0 || fd >= ST_MAX_MAPPED_FD || !st_map_experts_enabled()) return NULL;
+    /* Acquire: a base published below carries g_st_shard_len[fd] with it. */
+    const uint8_t *base = __atomic_load_n(&g_st_shard_base[fd], __ATOMIC_ACQUIRE);
+    if (base) return base;
+    /* Claim the fd exactly once. The losing thread does not block: NULL is the
+     * documented "use pread" answer, so it takes the pread path for this one
+     * call rather than parking an OpenMP worker behind an mmap. */
+    signed char unclaimed = 0;
+    if (!__atomic_compare_exchange_n(&g_st_shard_tried[fd], &unclaimed, (signed char)1,
+                                     0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return __atomic_load_n(&g_st_shard_base[fd], __ATOMIC_ACQUIRE);
+    int64_t len = (int64_t)lseek(fd, 0, SEEK_END);
+    if (len <= 0) return NULL;
+    compat_ro_map map; const void *data;
+    if (compat_map_readonly(fd, 0, (size_t)len, &map, &data) != 0) return NULL;
+    /* The compat_ro_map itself is intentionally not tracked for unmap: shard
+     * mappings live exactly as long as the fd they wrap, i.e. the process. */
+    /* Length first, then release-store the base: whoever sees the base through
+     * the acquire load above necessarily sees the length too. */
+    g_st_shard_len[fd] = len;
+    __atomic_store_n(&g_st_shard_base[fd], (uint8_t *)data, __ATOMIC_RELEASE);
+    return (const uint8_t *)data;
+}
+
+/* Serves [off, off+nbytes) of file `fd` directly out of its persistent
+ * mapping -- no allocation, no copy. Returns NULL if mapping is disabled,
+ * unavailable for this fd, or the range doesn't fit; the caller's existing
+ * pread path is the correct fallback in every NULL case. */
+static const void *st_map_shard_range(int fd, int64_t off, int64_t nbytes) {
+    if (off < 0 || nbytes <= 0) return NULL;
+    const uint8_t *base = st_shard_mapped(fd);
+    if (!base) return NULL;
+    if (off > g_st_shard_len[fd] - nbytes) return NULL;
+    return base + off;
+}
+
+/* Read an exact byte slice from a tensor into a caller-owned buffer.  This is
+ * the raw counterpart of st_read_slice_f32: byte_off/nbytes are relative to
+ * the tensor (not the shard), and cap is the actual byte capacity of `out`.
+ * It is deliberately usable for one-byte F8 rows and eight-byte I64 rows;
+ * there is no dtype conversion or element-size assumption here. */
+static void st_read_slice_raw_cap(shards *S, const char *name, int64_t byte_off,
+                                  int64_t nbytes, void *out, int64_t cap, int drop) {
+    st_tensor *t = st_find(S, name);
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
+    if (byte_off < 0 || nbytes < 0) {
+        fprintf(stderr, "slice %s [%lld,+%lld) has negative offset/length\n",
+                name, (long long)byte_off, (long long)nbytes); exit(1);
+    }
+    if (cap < 0 || nbytes > cap) {
+        fprintf(stderr, "slice %s requests %lld bytes, destination holds %lld — refusing\n",
+                name, (long long)nbytes, (long long)cap); exit(1);
+    }
+    if (t->nbytes < 0 || byte_off > t->nbytes || nbytes > t->nbytes - byte_off) {
+        fprintf(stderr, "slice %s [%lld,+%lld) out of tensor byte bounds (%lld)\n",
+                name, (long long)byte_off, (long long)nbytes, (long long)t->nbytes); exit(1);
+    }
+    if ((uint64_t)nbytes > SIZE_MAX) {
+        fprintf(stderr, "slice %s requests %lld bytes, exceeds host size_t\n",
+                name, (long long)nbytes); exit(1);
+    }
+    if (nbytes > 0 && !out) {
+        fprintf(stderr, "slice %s has a NULL destination for %lld bytes\n",
+                name, (long long)nbytes); exit(1);
+    }
+    if (t->off < 0 || byte_off > INT64_MAX - t->off) {
+        fprintf(stderr, "slice %s file offset overflows int64\n", name); exit(1);
+    }
+    int64_t boff = t->off + byte_off;
+    st_pread_full(t->fd, out, nbytes, boff, "pread raw slice");
+    /* A zero length to posix_fadvise means "through EOF" on POSIX, which is
+     * broader than this request.  Do not issue it for an empty slice. */
+    if (drop && nbytes > 0) posix_fadvise(t->fd, boff, nbytes, POSIX_FADV_DONTNEED);
 }
 
 /* legge una FETTA di un tensore: n_elems a partire dall'elemento elem_off.
@@ -830,7 +1530,7 @@ static void st_read_raw_cap(shards *S, const char *name, void *out, int64_t cap,
  * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->dtype >= 3) {   /* stesso motivo di st_read_f32 sopra */
         fprintf(stderr, "slice %s: tensor is %s — not a float tensor\n",
                 name, st_dtype_name(t->dtype)); exit(1); }
@@ -838,15 +1538,25 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     if (elem_off < 0 || n_elems < 0 || elem_off > t->numel || n_elems > t->numel - elem_off) {   /* keep the slice inside the tensor; subtraction avoids overflow (#1) */
         fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
                 name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
+    if (elem_off > INT64_MAX / esz || n_elems > INT64_MAX / esz ||
+        t->off < 0 || elem_off * esz > INT64_MAX - t->off ||
+        (uint64_t)(n_elems * esz) > SIZE_MAX || (n_elems > 0 && !out)) {
+        fprintf(stderr, "slice %s byte arithmetic/destination is invalid — refusing\n", name); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
-    void *raw = malloc(nb);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
-    st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
-    if (t->dtype == 2) memcpy(out, raw, nb);
-    else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
-    else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
+    void *raw = nb ? malloc((size_t)nb) : NULL;
+    if (nb && !raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for slice %s failed", (long long)nb, name);
+    if (nb) st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
+    if (nb) {
+        if (t->dtype == 2) memcpy(out, raw, (size_t)nb);
+        else if (t->dtype == 0) bf16_to_f32_bulk((uint16_t *)raw, out, n_elems);
+        else f16_to_f32_bulk((uint16_t *)raw, out, n_elems);
+    }
     free(raw);
-    if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
+    if (drop && nb) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
 }
+
+#ifdef ST_GGUF
+#include "st_gguf.h"
+#endif
 
 #endif
